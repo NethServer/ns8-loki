@@ -10,7 +10,8 @@
     "properties": {
         "retention_days": {
             "type": "integer",
-            "description": "Retention period of logs, in days."
+            "description": "Retention period of logs, in days.",
+            "minimum": 1
         }
     }
 }
