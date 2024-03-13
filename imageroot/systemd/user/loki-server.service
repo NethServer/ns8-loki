@@ -17,7 +17,7 @@ ExecStart=/usr/bin/podman run \
     --replace \
     --name=%N \
     --volume=loki-server-data:/loki \
-    --volume=./loki-config.yaml:/etc/loki/local-config.yaml:Z \
+    --volume=%S/loki-config.yaml:/etc/loki/local-config.yaml:Z \
     --env=LOKI_RETENTION_PERIOD=${LOKI_RETENTION_PERIOD} \
     ${LOKI_IMAGE} \
     -config.file=/etc/loki/local-config.yaml \

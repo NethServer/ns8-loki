@@ -12,7 +12,3 @@ import agent
 # Set environment variables
 if os.getenv('LOKI_RETENTION_PERIOD') is None:
     agent.set_env('LOKI_RETENTION_PERIOD', '365d')
-
-# install -m 0644 ../loki-config.yaml loki-config.yaml
-if not os.path.exists('loki-config.yaml'):
-    agent.run_helper('install', '-m', '0644', '../loki-config.yaml', 'loki-config.yaml')
