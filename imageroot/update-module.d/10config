@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2024 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+import os
+
+import agent
+
+# Set environment variables
+if os.getenv('LOKI_RETENTION_PERIOD') is None:
+    agent.set_env('LOKI_RETENTION_PERIOD', '365d')
+
+# install -m 0644 ../loki-config.yaml loki-config.yaml
+if not os.path.exists('loki-config.yaml'):
+    agent.run_helper('install', '-m', '0644', '../loki-config.yaml', 'loki-config.yaml')

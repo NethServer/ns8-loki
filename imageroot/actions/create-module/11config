@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+
+#
+# Copyright (C) 2024 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+install -m 0644 ../loki-config.yaml loki-config.yaml

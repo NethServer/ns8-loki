@@ -17,9 +17,12 @@ ExecStart=/usr/bin/podman run \
     --replace \
     --name=%N \
     --volume=loki-server-data:/loki \
+    --volume=./loki-config.yaml:/etc/loki/local-config.yaml:Z \
+    --env=LOKI_RETENTION_PERIOD=${LOKI_RETENTION_PERIOD} \
     ${LOKI_IMAGE} \
     -config.file=/etc/loki/local-config.yaml \
-    -log.level warn
+    -log.level=warn \
+    -config.expand-env
 
 ExecStop=/usr/bin/podman stop --ignore --cidfile %t/loki-server.ctr-id -t 10
 ExecStopPost=/usr/bin/podman rm --ignore -f --cidfile %t/loki-server.ctr-id
