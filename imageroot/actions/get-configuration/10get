@@ -10,5 +10,5 @@ import json
 import sys
 
 json.dump({
-    "retention_days": int(os.getenv('LOKI_RETENTION_PERIOD')[:-1])
+    "retention_days": int(os.getenv('LOKI_RETENTION_PERIOD'))
 }, sys.stdout)

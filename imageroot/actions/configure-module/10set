@@ -12,4 +12,4 @@ import agent
 
 request = json.load(sys.stdin)
 
-agent.set_env('LOKI_RETENTION_PERIOD', f"{request['retention_days']}d")
+agent.set_env('LOKI_RETENTION_PERIOD', f"{request['retention_days']}")
