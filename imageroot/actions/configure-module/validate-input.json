@@ -1,0 +1,16 @@
+{
+    "$schema": "http://json-schema.org/draft-04/schema#",
+    "$id": "http://schema.nethserver.org/loki/configure-module.json",
+    "title": "Configure Loki",
+    "description": "Configure Loki instance.",
+    "type": "object",
+    "required": [
+        "retention_days"
+    ],
+    "properties": {
+        "retention_days": {
+            "type": "integer",
+            "description": "Retention period of logs, in days. 0 means infinite."
+        }
+    }
+}
