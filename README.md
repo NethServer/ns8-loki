@@ -83,9 +83,13 @@ api-cli run module/loki1/get-configuration
 
 ```json
 {
-  "retention_days": 7
+  "retention_days": 7,
+  "active_from": "2021-05-28T15:49:27Z+00:00",
+  "active_to": "2021-05-28T15:49:27Z+00:00"
 }
 ```
+
+Note: `active_to` field WILL miss if the instance is still active.
 
 ## Uninstall
 

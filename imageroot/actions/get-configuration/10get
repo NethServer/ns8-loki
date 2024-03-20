@@ -9,6 +9,12 @@ import os
 import json
 import sys
 
-json.dump({
-    "retention_days": int(os.getenv('LOKI_RETENTION_PERIOD'))
-}, sys.stdout)
+response = {
+    "retention_days": int(os.getenv('LOKI_RETENTION_PERIOD')),
+    "active_from": os.getenv('LOKI_ACTIVE_FROM')
+}
+
+if os.getenv('LOKI_ACTIVE_TO') is not None:
+    response['active_to'] = os.getenv('LOKI_ACTIVE_TO')
+
+json.dump(response, sys.stdout)
