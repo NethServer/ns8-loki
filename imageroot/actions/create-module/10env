@@ -7,6 +7,7 @@
 
 import agent
 import os
+import datetime
 
 def genuuid():
     uuid =  os.popen("uuidgen")
@@ -24,3 +25,5 @@ agent.set_env('LOKI_API_AUTH_USERNAME', 'loki')
 agent.set_env('LOKI_API_AUTH_PASSWORD', genuuid())
 agent.set_env('LOKI_LOGS_INGRESS_TOKEN', genuuid())
 agent.set_env('LOKI_HTTP_PORT', port)
+agent.set_env('LOKI_RETENTION_PERIOD', '365')
+agent.set_env('LOKI_ACTIVE_FROM', datetime.datetime.now().astimezone().isoformat())

@@ -50,6 +50,47 @@ root@leader:~# logcli  query -q --no-labels -t '{nodename="leader"} | json | lin
 
 `logcli` will use the default Loki instance of the cluster, this can be changed using the environment variable [`LOKI_ADDR`](https://grafana.com/docs/loki/latest/getting-started/logcli/#example)
 
+## APIs
+
+The module provides some APIs to interact with the Loki instance:
+
+- `configure-module`
+- `get-configuration`
+
+### `configure-module`
+
+Configure the Loki instance.
+
+#### Parameters
+
+- `retention_days`: The number of days to keep the logs.
+
+#### Example
+
+```bash
+api-cli run module/loki1/configure-module '{"retention_days": 7}'
+```
+
+### `get-configuration`
+
+Get the Loki instance configuration.
+
+#### Example
+
+```bash
+api-cli run module/loki1/get-configuration
+```
+
+```json
+{
+  "retention_days": 7,
+  "active_from": "2021-05-28T15:49:27Z+00:00",
+  "active_to": "2021-05-28T15:49:27Z+00:00"
+}
+```
+
+Note: `active_to` field WILL miss if the instance is still active.
+
 ## Uninstall
 
 To uninstall the instance:

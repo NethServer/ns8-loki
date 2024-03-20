@@ -34,5 +34,6 @@ for evar in [
         "LOKI_API_AUTH_PASSWORD",
         "LOKI_LOGS_INGRESS_TOKEN",
         "LOKI_HTTP_PORT",
+        "LOKI_RETENTION_PERIOD",
     ]:
     agent.set_env(evar, original_environment[evar])

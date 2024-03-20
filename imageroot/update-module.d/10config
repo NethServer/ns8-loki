@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2024 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+import datetime
+import os
+
+import agent
+
+# Set environment variables
+if os.getenv('LOKI_ACTIVE_FROM') is None:
+    # This is the most unorthodox way to get the file creation time, which is not even guaranteed to be the same as the time the file was written to disk
+    agent.set_env('LOKI_ACTIVE_FROM', datetime.datetime.fromtimestamp(os.stat('environment').st_mtime).astimezone().isoformat())
+if os.getenv('LOKI_RETENTION_PERIOD') is None:
+    agent.set_env('LOKI_RETENTION_PERIOD', '365')
