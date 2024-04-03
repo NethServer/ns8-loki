@@ -17,5 +17,5 @@ if os.getenv("AGENT_EVENT_SOURCE") == 'cluster':
     # parse data
     data = json.load(sys.stdin)
     if 'instance' in data and data['instance'] == 'loki':
-        if 'previous' in data and data['previous'] == os.getenv('MODULE_ID'):
+        if 'previous' in data and data['previous'] == os.getenv('MODULE_ID') and os.getenv('LOKI_ACTIVE_TO') is None:
             agent.set_env('LOKI_ACTIVE_TO', datetime.datetime.now().astimezone().isoformat())
