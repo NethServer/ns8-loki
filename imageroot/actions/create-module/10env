@@ -20,10 +20,16 @@ rdb = agent.redis_connect()
 rkey = f'node/{node_id}/vpn'
 ip_address = rdb.hget(rkey, 'ip_address')
 
+# Discover the currently active Loki instance
+active_agent = agent.resolve_agent_id("loki@cluster") or os.environ["AGENT_ID"]
+
+# Copy the retention value from the active Loki instance
+initial_retention = rdb.hget(f'{active_agent}/environment', 'LOKI_RETENTION_PERIOD') or '365'
+
 agent.set_env('LOKI_ADDR', ip_address)
 agent.set_env('LOKI_API_AUTH_USERNAME', 'loki')
 agent.set_env('LOKI_API_AUTH_PASSWORD', genuuid())
 agent.set_env('LOKI_LOGS_INGRESS_TOKEN', genuuid())
 agent.set_env('LOKI_HTTP_PORT', port)
-agent.set_env('LOKI_RETENTION_PERIOD', '365')
+agent.set_env('LOKI_RETENTION_PERIOD', initial_retention)
 agent.set_env('LOKI_ACTIVE_FROM', datetime.datetime.now().astimezone().isoformat())
