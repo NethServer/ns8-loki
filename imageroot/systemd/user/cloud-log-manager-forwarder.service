@@ -1,0 +1,11 @@
+[Unit]
+Description=Cloud Log Manager Forwarder
+Requires=loki-server.service
+After=loki-server.service
+
+[Service]
+Restart=always
+ExecStart=runagent %S/bin/cloud-log-manager-forwarder
+
+[Install]
+WantedBy=default.target

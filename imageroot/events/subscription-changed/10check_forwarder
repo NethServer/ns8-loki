@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2024 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+import sys
+import json
+import agent
+import subprocess
+
+data = json.load(sys.stdin)
+
+if data['action'] == 'terminated':
+    agent.unset_env('CLOUD_LOG_MANAGER_UUID')
+    agent.unset_env('CLOUD_LOG_MANAGER_START_TIME')
+    agent.unset_env('CLOUD_LOG_MANAGER_ADDRESS')
+    agent.unset_env('CLOUD_LOG_MANAGER_TENANT')
+
+    subprocess.run(["systemctl", "--user", "disable", "--now", "cloud-log-manager-forwarder.service"], 
+                    stdout=subprocess.PIPE,
+                    stderr=sys.stderr,
+                    text=True,
+                    check=True)

@@ -1,0 +1,28 @@
+{
+    "$schema": "http://json-schema.org/draft-04/schema#",
+    "$id": "http://schema.nethserver.org/loki/set-clm-forwarder.json",
+    "title": "Configure Cloud Log Manager Forwarder",
+    "description": "Configure Cloud Log Manager Forwarder service.",
+    "type": "object",
+    "required": [
+        "active"
+    ],
+    "properties": {
+        "active": {
+            "type": "boolean",
+            "description": "Action condition to be set."
+        },
+        "address": {
+            "type": "string",
+            "description": "Cloud log manager server address."
+        },
+        "tenant": {
+            "type": "string",
+            "description": "Cloud log manager tenant."
+        },
+        "start_time": {
+            "type": "string",
+            "description": "Log forwarding start time."
+        }
+    }
+}
