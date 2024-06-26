@@ -21,16 +21,15 @@ if (request['active']):
     agent.set_env('SYSLOG_PROTOCOL', f"{request['protocol']}")
     agent.set_env('SYSLOG_FORMAT', f"{request['format']}")
 
-    if (request['start_time'] != ''):
+    if 'start_time' in request and request['start_time'] != '':
         agent.set_env('SYSLOG_START_TIME', f"{request['start_time']}")
 
     # If process is running, restart with new env variables, otherwise enable it
-    with subprocess.Popen(['systemctl', '--user', 'is-active', 'syslog-forwarder'], stdout=subprocess.PIPE, stderr=sys.stderr) as pipe:
-        response = pipe.stdout.readline().decode('utf-8').replace('\n', '')
-        if response in {'active', 'failed'}:
-            action = 'restart'
-        else:
-            action = 'enable'
+    response = subprocess.run(['systemctl', '--user', 'is-active', 'syslog-forwarder'], capture_output=True, text=True)
+    if response.stdout in ['active', 'failed']:
+        action = 'restart'
+    else:
+        action = 'enable'
 else:
     agent.unset_env('SYSLOG_ADDRESS')
     agent.unset_env('SYSLOG_PORT')
@@ -41,7 +40,7 @@ else:
     action = 'disable'
 
 subprocess.run(["systemctl", "--user", action, "--now", "syslog-forwarder.service"], 
-                stdout=subprocess.PIPE,
+                stdout=sys.stderr,
                 stderr=sys.stderr,
                 text=True,
                 check=True)

@@ -16,13 +16,13 @@ import subprocess
 
 cloud_log_manager = {}
 
-with subprocess.Popen(['systemctl', '--user', 'is-active', 'cloud-log-manager-forwarder'], stdout=subprocess.PIPE, stderr=sys.stderr) as pipe:
-    response = pipe.stdout.readline().decode('utf-8').replace('\n', '')
-    if 'inactive' in response:
-        cloud_log_manager["status"] = 'inactive'
-    elif 'active' in response:
+response = subprocess.run(['systemctl', '--user', 'is-active', 'cloud-log-manager-forwarder'], capture_output=True, text=True)
+match response.stdout:
+    case 'active':
         cloud_log_manager["status"] = 'active'
-    elif 'failed' in response:
+    case 'inactive':
+        cloud_log_manager["status"] = 'inactive'
+    case 'failed':
         cloud_log_manager["status"] = 'failed'
 
 cloud_log_manager["address"] = os.getenv('CLOUD_LOG_MANAGER_ADDRESS', '')
@@ -38,13 +38,13 @@ except:
 
 syslog = {}
 
-with subprocess.Popen(['systemctl', '--user', 'is-active', 'syslog-forwarder'], stdout=subprocess.PIPE, stderr=sys.stderr) as pipe:
-    response = pipe.stdout.readline().decode('utf-8').replace('\n', '')
-    if 'inactive' in response:
-        syslog["status"] = 'inactive'
-    elif 'active' in response:
+response = subprocess.run(['systemctl', '--user', 'is-active', 'syslog-forwarder'], capture_output=True, text=True)
+match response.stdout:
+    case 'active':
         syslog["status"] = 'active'
-    elif 'failed' in response:
+    case 'inactive':
+        syslog["status"] = 'inactive'
+    case 'failed':
         syslog["status"] = 'failed'
 
 syslog["address"] = os.getenv('SYSLOG_ADDRESS', '')

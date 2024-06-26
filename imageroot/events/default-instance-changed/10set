@@ -30,16 +30,14 @@ if os.getenv("AGENT_EVENT_SOURCE") == 'cluster':
             
             # Disable cloud log manager service
             subprocess.run(["systemctl", "--user", "disable", "--now", "cloud-log-manager-forwarder.service"],
-                            stdout=subprocess.PIPE,
+                            stdout=sys.stderr,
                             stderr=sys.stderr,
-                            text=True,
                             check=True)
 
             # Disable syslog service
             subprocess.run(["systemctl", "--user", "disable", "--now", "syslog-forwarder.service"],
-                            stdout=subprocess.PIPE,
+                            stdout=sys.stderr,
                             stderr=sys.stderr,
-                            text=True,
                             check=True)
             
             agent.unset_env('CLOUD_LOG_MANAGER_HOSTNAME')

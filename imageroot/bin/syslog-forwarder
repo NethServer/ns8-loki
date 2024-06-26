@@ -71,63 +71,63 @@ while True:
         # LogCLI command
         logcli_command = ["logcli", "query", "--limit", "0", "--forward", "--timezone", "UTC", 
                           "--from", last_timestamp, "--no-labels", "-q", "-o", "jsonl", '{node_id=~".+"}']
-        with subprocess.Popen(logcli_command, stdout=subprocess.PIPE) as logs:
-            for log in logs.stdout.readlines():
-                try:
-                    # Log if stdout contains something new
-                    if log:
-                        json_object = json.loads(log)
-                        line = json.loads(json_object["line"])
+        response = subprocess.run(logcli_command, capture_output=True, text=True)
+        for log in response.stdout.splitlines():
+            try:
+                # Log if stdout contains something new
+                if log:
+                    json_object = json.loads(log)
+                    line = json.loads(json_object["line"])
 
-                        # Format log based on rfc format
-                        if FORMAT == "rfc3164":
-                            if "_HOSTNAME" not in line:
-                                line["_HOSTNAME"] = ""
+                    # Format log based on rfc format
+                    if FORMAT == "rfc3164":
+                        if "_HOSTNAME" not in line:
+                            line["_HOSTNAME"] = ""
 
-                            if "SYSLOG_IDENTIFIER" not in line:
-                                line["SYSLOG_IDENTIFIER"] = ""
+                        if "SYSLOG_IDENTIFIER" not in line:
+                            line["SYSLOG_IDENTIFIER"] = ""
 
-                            if "_PID" not in line:
-                                line["_PID"] = ""
+                        if "_PID" not in line:
+                            line["_PID"] = ""
 
-                            # Set facility value
-                            try:
-                                facility = int(line["SYSLOG_FACILITY"])
-                            except:
-                                facility = transports.get(line["_TRANSPORT"], 18)
+                        # Set facility value
+                        try:
+                            facility = int(line["SYSLOG_FACILITY"])
+                        except:
+                            facility = transports.get(line["_TRANSPORT"], 18)
 
-                            if "PRIORITY" not in line:
-                                line["PRIORITY"] = 6
+                        if "PRIORITY" not in line:
+                            line["PRIORITY"] = 6
 
-                            log_priority=(facility * 8) + int(line["PRIORITY"])
+                        log_priority=(facility * 8) + int(line["PRIORITY"])
 
-                            # Format message
-                            message = "<{priority}>{timestamp} {hostname} {process}[{pid}]: {message}".format(priority=log_priority,
-                                                                                                                timestamp=json_object["timestamp"], 
-                                                                                                                hostname=line["_HOSTNAME"],
-                                                                                                                process=line["SYSLOG_IDENTIFIER"],
-                                                                                                                pid=line["_PID"],
-                                                                                                                message=line["MESSAGE"])
-                        elif FORMAT == "rfc5424":
-                            # Format message
-                            message = "{timestamp} {hostname} {process}[{pid}]: {message}".format(timestamp=json_object["timestamp"], 
-                                                                                                    hostname=line["_HOSTNAME"],
-                                                                                                    process=line["SYSLOG_IDENTIFIER"],
-                                                                                                    pid=line["_PID"],
-                                                                                                    message=line["MESSAGE"])
+                        # Format message
+                        message = "<{priority}>{timestamp} {hostname} {process}[{pid}]: {message}".format(priority=log_priority,
+                                                                                                            timestamp=json_object["timestamp"], 
+                                                                                                            hostname=line["_HOSTNAME"],
+                                                                                                            process=line["SYSLOG_IDENTIFIER"],
+                                                                                                            pid=line["_PID"],
+                                                                                                            message=line["MESSAGE"])
+                    elif FORMAT == "rfc5424":
+                        # Format message
+                        message = "{timestamp} {hostname} {process}[{pid}]: {message}".format(timestamp=json_object["timestamp"], 
+                                                                                                hostname=line["_HOSTNAME"],
+                                                                                                process=line["SYSLOG_IDENTIFIER"],
+                                                                                                pid=line["_PID"],
+                                                                                                message=line["MESSAGE"])
 
-                        # Control if log has newline characters to avoid overlapping
-                        if message.find("\n") == -1:
-                            message += "\n"
+                    # Control if log has newline characters to avoid overlapping
+                    if message.find("\n") == -1:
+                        message += "\n"
 
-                        # Send log to syslog server
-                        sock.send(message.encode())
+                    # Send log to syslog server
+                    sock.send(message.encode())
 
-                        # Save log timestamp only when socket send succeed
-                        last_timestamp = json_object["timestamp"]
-                except Exception as exc:
-                    print(f"Error on log format: {exc}", file=sys.stderr)
-                    pass
+                    # Save log timestamp only when socket send succeed
+                    last_timestamp = json_object["timestamp"]
+            except Exception as exc:
+                print(f"Error on log format: {exc}", file=sys.stderr)
+                pass
 
         # Increment timestamp by 1 microsecond to prevent sending the same log multiple times
         last_timestamp = (datetime.strptime(last_timestamp, '%Y-%m-%dT%H:%M:%S.%fZ') + timedelta(microseconds=1)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')

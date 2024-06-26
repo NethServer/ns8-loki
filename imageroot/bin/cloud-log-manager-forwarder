@@ -88,44 +88,44 @@ while True:
         # LogCLI command
         logcli_command = ["logcli", "query", "--limit", "0", "--forward", "--timezone", "UTC", "--from", last_timestamp, "--no-labels", "-q", "-o", "jsonl",
                           '{node_id=~".+"} | json severity="PRIORITY", priority="SYSLOG_IDENTIFIER", pid="_PID", message="MESSAGE" | line_format "<{{.priority}}> [{{.node_id}}:{{.module_id}}:{{.process}}] {{.process}}[{{.pid}}]: {{.message}}"']
-        with subprocess.Popen(logcli_command, stdout=subprocess.PIPE) as logs:
-            for log in logs.stdout.readlines():
-                try:
-                    # Log if stdout contains something new
-                    if log:
-                        json_object = json.loads(log)
-                        line = str(json_object["line"])
+        response = subprocess.run(logcli_command, capture_output=True, text=True)
+        for log in response.stdout.splitlines():
+            try:
+                # Log if stdout contains something new
+                if log:
+                    json_object = json.loads(log)
+                    line = str(json_object["line"])
 
-                        # Check if priority is set
-                        try:
-                            priority = int(line[line.find("<")+1:line.find(">")])
-                        except:
-                            priority = 6
+                    # Check if priority is set
+                    try:
+                        priority = int(line[line.find("<")+1:line.find(">")])
+                    except:
+                        priority = 6
 
-                        # Json data for post request
-                        json_log = {
-                            "UUID": UUID,
-                            "PC": HOSTNAME,
-                            "DTA": datetime.strptime(json_object["timestamp"], '%Y-%m-%dT%H:%M:%S.%fZ').strftime("%Y-%m-%d"),
-                            "TIME": datetime.strptime(json_object["timestamp"], '%Y-%m-%dT%H:%M:%S.%fZ').strftime("%H:%M:%S"),
-                            "MSG": line[line.find("]")+2:],
-                            "SOURCE": line[line.find("["):line.find("]")+1],
-                            "LOGTYPE": severity.get(priority, 6),
-                            "SITE": TENANT
-                        }
+                    # Json data for post request
+                    json_log = {
+                        "UUID": UUID,
+                        "PC": HOSTNAME,
+                        "DTA": datetime.strptime(json_object["timestamp"], '%Y-%m-%dT%H:%M:%S.%fZ').strftime("%Y-%m-%d"),
+                        "TIME": datetime.strptime(json_object["timestamp"], '%Y-%m-%dT%H:%M:%S.%fZ').strftime("%H:%M:%S"),
+                        "MSG": line[line.find("]")+2:],
+                        "SOURCE": line[line.find("["):line.find("]")+1],
+                        "LOGTYPE": severity.get(priority, 6),
+                        "SITE": TENANT
+                    }
 
-                        logs_list.append(json_log)
+                    logs_list.append(json_log)
 
-                        # Save log timestamp only when socket send succeed
-                        last_timestamp = json_object["timestamp"]
+                    # Save log timestamp only when socket send succeed
+                    last_timestamp = json_object["timestamp"]
 
-                        # If list size is bigger than 128 kB, send
-                        if sys.getsizeof(logs_list) >= 131072:
-                            send_logs_list(logs_list, last_timestamp)
-                            logs_list.clear()
-                except Exception as exc:
-                    print(f"Error on log format: {exc}", file=sys.stderr)
-                    pass
+                    # If list size is bigger than 128 kB, send
+                    if sys.getsizeof(logs_list) >= 131072:
+                        send_logs_list(logs_list, last_timestamp)
+                        logs_list.clear()
+            except Exception as exc:
+                print(f"Error on log format: {exc}", file=sys.stderr)
+                pass
 
         # When loop terminate, if list isn't empty, send
         if len(logs_list) > 0:
