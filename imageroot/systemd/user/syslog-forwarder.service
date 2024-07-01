@@ -1,0 +1,11 @@
+[Unit]
+Description=Syslog Forwarder
+Requires=loki-server.service
+After=loki-server.service
+
+[Service]
+Restart=always
+ExecStart=runagent %S/bin/syslog-forwarder
+
+[Install]
+WantedBy=default.target

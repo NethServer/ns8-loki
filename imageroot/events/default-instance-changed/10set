@@ -9,13 +9,69 @@ import json
 import os
 import sys
 import datetime
+import subprocess
+import hashlib
 
 import agent
 
 # Check if event comes from the cluster
 if os.getenv("AGENT_EVENT_SOURCE") == 'cluster':
-    # parse data
+
+    # Parse data
     data = json.load(sys.stdin)
+
     if 'instance' in data and data['instance'] == 'loki':
-        if 'previous' in data and data['previous'] == os.getenv('MODULE_ID') and os.getenv('LOKI_ACTIVE_TO') is None:
-            agent.set_env('LOKI_ACTIVE_TO', datetime.datetime.now().astimezone().isoformat())
+
+        # Old instance
+        if 'previous' in data and data['previous'] == os.getenv('MODULE_ID'):
+            # Set loki active to
+            if os.getenv('LOKI_ACTIVE_TO') is None:
+                agent.set_env('LOKI_ACTIVE_TO', datetime.datetime.now().astimezone().isoformat())
+            
+            # Disable cloud log manager service
+            subprocess.run(["systemctl", "--user", "disable", "--now", "cloud-log-manager-forwarder.service"],
+                            stdout=sys.stderr,
+                            stderr=sys.stderr,
+                            check=True)
+
+            # Disable syslog service
+            subprocess.run(["systemctl", "--user", "disable", "--now", "syslog-forwarder.service"],
+                            stdout=sys.stderr,
+                            stderr=sys.stderr,
+                            check=True)
+            
+            agent.unset_env('CLOUD_LOG_MANAGER_HOSTNAME')
+                
+        # New instance
+        if 'current' in data and data['current'] == os.getenv('MODULE_ID'):
+            rdb = agent.redis_connect()
+            previous_environment = rdb.hgetall(f"module/{data['previous']}/environment")
+            subscription = rdb.hgetall('cluster/subscription')
+
+            # If cloud log manager service was active in old instance, start on new instacnce
+            if all(key in previous_environment for key in ('CLOUD_LOG_MANAGER_ADDRESS', 'CLOUD_LOG_MANAGER_TENANT', 'CLOUD_LOG_MANAGER_UUID')) and bool(subscription):
+                cluster_uuid = rdb.get('cluster/uuid')
+                
+                agent.set_env('CLOUD_LOG_MANAGER_UUID', previous_environment['CLOUD_LOG_MANAGER_UUID'])
+                agent.set_env('CLOUD_LOG_MANAGER_HOSTNAME', 'cluster-' + hashlib.sha256(cluster_uuid.encode("utf-8")).hexdigest()[:8])
+                agent.set_env('CLOUD_LOG_MANAGER_ADDRESS', previous_environment['CLOUD_LOG_MANAGER_ADDRESS'])
+                agent.set_env('CLOUD_LOG_MANAGER_TENANT', previous_environment['CLOUD_LOG_MANAGER_TENANT'])
+
+                subprocess.run(["systemctl", "--user", "enable", "--now", "cloud-log-manager-forwarder.service"],
+                                stdout=subprocess.PIPE,
+                                stderr=sys.stderr,
+                                text=True,
+                                check=True)
+            
+            # If syslog service was active in old instance, start on new instacnce
+            if all(key in previous_environment for key in ('SYSLOG_ADDRESS', 'SYSLOG_PORT', 'SYSLOG_PROTOCOL', 'SYSLOG_FORMAT')):
+                agent.set_env('SYSLOG_ADDRESS', previous_environment['SYSLOG_ADDRESS'])
+                agent.set_env('SYSLOG_PORT', previous_environment['SYSLOG_PORT'])
+                agent.set_env('SYSLOG_PROTOCOL', previous_environment['SYSLOG_PROTOCOL'])
+                agent.set_env('SYSLOG_FORMAT', previous_environment['SYSLOG_FORMAT'])
+
+                subprocess.run(["systemctl", "--user", "enable", "--now", "syslog-forwarder.service"],
+                                stdout=subprocess.PIPE,
+                                stderr=sys.stderr,
+                                text=True,
+                                check=True)

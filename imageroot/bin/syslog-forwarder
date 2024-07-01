@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2024 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+from datetime import datetime, timedelta, timezone
+
+import subprocess
+import agent
+import json
+import time
+import socket
+import os
+import sys
+
+#-------------------------------- CONFIG --------------------------------#
+
+try:
+    ADDRESS = os.environ.get('SYSLOG_ADDRESS')
+    PORT = os.environ.get('SYSLOG_PORT', '514')
+    PROTOCOL = os.environ.get('SYSLOG_PROTOCOL', 'udp')
+    FORMAT = os.environ.get('SYSLOG_FORMAT', 'rfc3164')
+    START_TIME = os.environ.get('SYSLOG_START_TIME', '')
+
+    os.environ['LOKI_ADDR'] = f"http://127.0.0.1:{os.environ['LOKI_HTTP_PORT']}"
+    os.environ['LOKI_USERNAME'] = os.environ['LOKI_API_AUTH_USERNAME']
+    os.environ['LOKI_PASSWORD'] = os.environ['LOKI_API_AUTH_PASSWORD']
+except Exception as exc:
+    print(f"Error variables settings: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+#--------------------------------- CODE ---------------------------------#
+
+# Define transport facility
+transports = {
+    'kernel': 0,
+    'driver': 3,
+    'audit': 13,
+    'journal': 16,
+    'stdout': 17
+}
+
+# Logging setup
+try:
+    if PROTOCOL == "udp":
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    elif PROTOCOL == "tcp":
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    sock.connect((ADDRESS, int(PORT)))
+except Exception as exc:
+    print(f"Error during setup: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+# If exists, read from file last log timestamp sent
+if START_TIME == '':
+    if os.path.exists("./syslog_last_timestamp") and os.path.getsize("./syslog_last_timestamp") > 0:
+        with open("./syslog_last_timestamp", "r") as tf:
+            last_timestamp = tf.read()
+    else:
+        last_timestamp = (datetime.now(timezone.utc)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+else:
+    last_timestamp = START_TIME
+    agent.unset_env('SYSLOG_START_TIME')
+
+# Every x seconds execute logcli command and send logs to syslog server
+while True:
+    try:
+        # LogCLI command
+        logcli_command = ["logcli", "query", "--limit", "0", "--forward", "--timezone", "UTC", 
+                          "--from", last_timestamp, "--no-labels", "-q", "-o", "jsonl", '{node_id=~".+"}']
+        response = subprocess.run(logcli_command, capture_output=True, text=True)
+        for log in response.stdout.splitlines():
+            try:
+                # Log if stdout contains something new
+                if log:
+                    json_object = json.loads(log)
+                    line = json.loads(json_object["line"])
+
+                    # Format log based on rfc format
+                    if FORMAT == "rfc3164":
+                        if "_HOSTNAME" not in line:
+                            line["_HOSTNAME"] = ""
+
+                        if "SYSLOG_IDENTIFIER" not in line:
+                            line["SYSLOG_IDENTIFIER"] = ""
+
+                        if "_PID" not in line:
+                            line["_PID"] = ""
+
+                        # Set facility value
+                        try:
+                            facility = int(line["SYSLOG_FACILITY"])
+                        except:
+                            facility = transports.get(line["_TRANSPORT"], 18)
+
+                        if "PRIORITY" not in line:
+                            line["PRIORITY"] = 6
+
+                        log_priority=(facility * 8) + int(line["PRIORITY"])
+
+                        # Format message
+                        message = "<{priority}>{timestamp} {hostname} {process}[{pid}]: {message}".format(priority=log_priority,
+                                                                                                            timestamp=json_object["timestamp"], 
+                                                                                                            hostname=line["_HOSTNAME"],
+                                                                                                            process=line["SYSLOG_IDENTIFIER"],
+                                                                                                            pid=line["_PID"],
+                                                                                                            message=line["MESSAGE"])
+                    elif FORMAT == "rfc5424":
+                        # Format message
+                        message = "{timestamp} {hostname} {process}[{pid}]: {message}".format(timestamp=json_object["timestamp"], 
+                                                                                                hostname=line["_HOSTNAME"],
+                                                                                                process=line["SYSLOG_IDENTIFIER"],
+                                                                                                pid=line["_PID"],
+                                                                                                message=line["MESSAGE"])
+
+                    # Control if log has newline characters to avoid overlapping
+                    if message.find("\n") == -1:
+                        message += "\n"
+
+                    # Send log to syslog server
+                    sock.send(message.encode())
+
+                    # Save log timestamp only when socket send succeed
+                    last_timestamp = json_object["timestamp"]
+            except Exception as exc:
+                print(f"Error on log format: {exc}", file=sys.stderr)
+                pass
+
+        # Increment timestamp by 1 microsecond to prevent sending the same log multiple times
+        last_timestamp = (datetime.strptime(last_timestamp, '%Y-%m-%dT%H:%M:%S.%fZ') + timedelta(microseconds=1)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+        # Write on file the last log sent timestamp
+        timestamp_file = open("./syslog_last_timestamp", "w")
+        timestamp_file.write(last_timestamp)
+        timestamp_file.close()
+
+    except Exception as exc:
+        print(f"Error during loop: {exc}", file=sys.stderr)
+    finally:
+        time.sleep(10)

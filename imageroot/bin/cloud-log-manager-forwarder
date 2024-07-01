@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2024 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+from datetime import datetime, timedelta, timezone
+from urllib3.util import Retry
+from requests import Session
+from requests.adapters import HTTPAdapter
+
+import subprocess
+import agent
+import json
+import time
+import os
+import sys
+
+#-------------------------------- CONFIG --------------------------------#
+
+try:
+    UUID = os.environ.get('CLOUD_LOG_MANAGER_UUID')
+    HOSTNAME = os.environ.get('CLOUD_LOG_MANAGER_HOSTNAME')
+    START_TIME = os.environ.get('CLOUD_LOG_MANAGER_START_TIME', '')
+    ADDRESS = os.environ.get('CLOUD_LOG_MANAGER_ADDRESS', 'https://nar.nethesis.it')
+    TENANT = os.environ.get('CLOUD_LOG_MANAGER_TENANT')
+
+    os.environ['LOKI_ADDR'] = f"http://127.0.0.1:{os.environ['LOKI_HTTP_PORT']}"
+    os.environ['LOKI_USERNAME'] = os.environ['LOKI_API_AUTH_USERNAME']
+    os.environ['LOKI_PASSWORD'] = os.environ['LOKI_API_AUTH_PASSWORD']
+except Exception as exc:
+    print(f"Error variables settings: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+#--------------------------------- CODE ---------------------------------#
+
+# Send log to gigasys server
+def send_logs_list(logs_list: list, last_timestamp: str):
+    session = Session()
+    retries = Retry(
+        backoff_factor=0.5,
+    )
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    session.post(ADDRESS + "/adm/syslog/noauth_put_json/", verify=True, data=json.dumps(logs_list))
+    session.close()
+
+    # Write on file the last log sent timestamp
+    with open("./cloud_log_manager_last_timestamp", "w") as tf:
+        tf.write(last_timestamp)
+
+# Define transport facility
+transports = {
+    'kernel': 0,
+    'driver': 3,
+    'audit': 13,
+    'journal': 16,
+    'stdout': 17
+}
+
+# Define severity
+severity = {
+    0: "Emergency",
+    1: "Warning",
+    2: "Error",
+    3: "Error",
+    4: "Warning",
+    5: "Information",
+    6: "Information",
+    7: "Debug",
+    8: "Warning"
+}
+
+if START_TIME == '':
+    if os.path.exists("./cloud_log_manager_last_timestamp") and os.path.getsize("./cloud_log_manager_last_timestamp") > 0:
+        with open("./cloud_log_manager_last_timestamp", "r") as tf:
+            last_timestamp = tf.read()
+    else:
+        last_timestamp = (datetime.now(timezone.utc)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+else:
+    last_timestamp = START_TIME
+    agent.unset_env('CLOUD_LOG_MANAGER_START_TIME')
+
+logs_list = []
+
+while True:
+    try:
+        # LogCLI command
+        logcli_command = ["logcli", "query", "--limit", "0", "--forward", "--timezone", "UTC", "--from", last_timestamp, "--no-labels", "-q", "-o", "jsonl",
+                          '{node_id=~".+"} | json severity="PRIORITY", priority="SYSLOG_IDENTIFIER", pid="_PID", message="MESSAGE" | line_format "<{{.priority}}> [{{.node_id}}:{{.module_id}}:{{.process}}] {{.process}}[{{.pid}}]: {{.message}}"']
+        response = subprocess.run(logcli_command, capture_output=True, text=True)
+        for log in response.stdout.splitlines():
+            try:
+                # Log if stdout contains something new
+                if log:
+                    json_object = json.loads(log)
+                    line = str(json_object["line"])
+
+                    # Check if priority is set
+                    try:
+                        priority = int(line[line.find("<")+1:line.find(">")])
+                    except:
+                        priority = 6
+
+                    # Json data for post request
+                    json_log = {
+                        "UUID": UUID,
+                        "PC": HOSTNAME,
+                        "DTA": datetime.strptime(json_object["timestamp"], '%Y-%m-%dT%H:%M:%S.%fZ').strftime("%Y-%m-%d"),
+                        "TIME": datetime.strptime(json_object["timestamp"], '%Y-%m-%dT%H:%M:%S.%fZ').strftime("%H:%M:%S"),
+                        "MSG": line[line.find("]")+2:],
+                        "SOURCE": line[line.find("["):line.find("]")+1],
+                        "LOGTYPE": severity.get(priority, 6),
+                        "SITE": TENANT
+                    }
+
+                    logs_list.append(json_log)
+
+                    # Save log timestamp only when socket send succeed
+                    last_timestamp = json_object["timestamp"]
+
+                    # If list size is bigger than 128 kB, send
+                    if sys.getsizeof(logs_list) >= 131072:
+                        send_logs_list(logs_list, last_timestamp)
+                        logs_list.clear()
+            except Exception as exc:
+                print(f"Error on log format: {exc}", file=sys.stderr)
+                pass
+
+        # When loop terminate, if list isn't empty, send
+        if len(logs_list) > 0:
+            # Increment timestamp by 1 microsecond to prevent sending the same log multiple times
+            last_timestamp = (datetime.strptime(last_timestamp, '%Y-%m-%dT%H:%M:%S.%fZ') + timedelta(microseconds=1)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+            # Send logs to gigasys server
+            send_logs_list(logs_list, last_timestamp)
+            logs_list.clear()
+
+    except Exception as exc:
+        print(f"Error during loop: {exc}", file=sys.stderr)
+        pass
+    finally:
+        time.sleep(10)

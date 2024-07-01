@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2024 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+import subprocess
+import agent
+import json
+import sys
+
+request = json.load(sys.stdin)
+
+if (request['active']):
+    rdb = agent.redis_connect()
+    cluster_uuid = rdb.get('cluster/uuid')
+
+    agent.set_env('SYSLOG_ADDRESS', f"{request['address']}")
+    agent.set_env('SYSLOG_PORT', f"{request['port']}")
+    agent.set_env('SYSLOG_PROTOCOL', f"{request['protocol']}")
+    agent.set_env('SYSLOG_FORMAT', f"{request['format']}")
+
+    if 'start_time' in request and request['start_time'] != '':
+        agent.set_env('SYSLOG_START_TIME', f"{request['start_time']}")
+
+    # If process is running, restart with new env variables, otherwise enable it
+    response = subprocess.run(['systemctl', '--user', 'is-active', 'syslog-forwarder'], capture_output=True, text=True)
+    if response.stdout in ['active', 'failed']:
+        action = 'restart'
+    else:
+        action = 'enable'
+else:
+    agent.unset_env('SYSLOG_ADDRESS')
+    agent.unset_env('SYSLOG_PORT')
+    agent.unset_env('SYSLOG_PROTOCOL')
+    agent.unset_env('SYSLOG_FORMAT')
+    agent.unset_env('SYSLOG_START_TIME')
+
+    action = 'disable'
+
+subprocess.run(["systemctl", "--user", action, "--now", "syslog-forwarder.service"], 
+                stdout=sys.stderr,
+                stderr=sys.stderr,
+                text=True,
+                check=True)

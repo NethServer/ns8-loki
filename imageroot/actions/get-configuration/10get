@@ -5,13 +5,66 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 
+from datetime import datetime, timezone
+
 import os
 import json
 import sys
+import subprocess
+
+# Cloud Log Manager
+
+cloud_log_manager = {}
+
+response = subprocess.run(['systemctl', '--user', 'is-active', 'cloud-log-manager-forwarder'], capture_output=True, text=True)
+match response.stdout:
+    case 'active':
+        cloud_log_manager["status"] = 'active'
+    case 'inactive':
+        cloud_log_manager["status"] = 'inactive'
+    case 'failed':
+        cloud_log_manager["status"] = 'failed'
+
+cloud_log_manager["address"] = os.getenv('CLOUD_LOG_MANAGER_ADDRESS', '')
+cloud_log_manager["tenant"] = os.getenv('CLOUD_LOG_MANAGER_TENANT', '')
+
+try: 
+    with open("./cloud_log_manager_last_timestamp", "r") as clm_file:
+        cloud_log_manager["last_timestamp"] = clm_file.read()
+except:
+    cloud_log_manager["last_timestamp"] = ""
+
+# Syslog
+
+syslog = {}
+
+response = subprocess.run(['systemctl', '--user', 'is-active', 'syslog-forwarder'], capture_output=True, text=True)
+match response.stdout:
+    case 'active':
+        syslog["status"] = 'active'
+    case 'inactive':
+        syslog["status"] = 'inactive'
+    case 'failed':
+        syslog["status"] = 'failed'
+
+syslog["address"] = os.getenv('SYSLOG_ADDRESS', '')
+syslog["port"] = os.getenv('SYSLOG_PORT', '')
+syslog["protocol"] = os.getenv('SYSLOG_PROTOCOL', '')
+syslog["format"] = os.getenv('SYSLOG_FORMAT', '')
+
+try:
+    with open("./syslog_last_timestamp", "r") as syslog_file:
+        syslog["last_timestamp"] = syslog_file.read()
+except:
+    syslog["last_timestamp"] = ""
+
+# General
 
 response = {
     "retention_days": int(os.getenv('LOKI_RETENTION_PERIOD')),
-    "active_from": os.getenv('LOKI_ACTIVE_FROM')
+    "active_from": os.getenv('LOKI_ACTIVE_FROM'),
+    "cloud_log_manager": cloud_log_manager,
+    "syslog": syslog
 }
 
 if os.getenv('LOKI_ACTIVE_TO') is not None:
