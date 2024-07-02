@@ -17,13 +17,13 @@ import subprocess
 cloud_log_manager = {}
 
 response = subprocess.run(['systemctl', '--user', 'is-active', 'cloud-log-manager-forwarder'], capture_output=True, text=True)
-match response.stdout:
+match response.stdout.strip():
     case 'active':
         cloud_log_manager["status"] = 'active'
-    case 'inactive':
-        cloud_log_manager["status"] = 'inactive'
     case 'failed':
         cloud_log_manager["status"] = 'failed'
+    case _:
+        cloud_log_manager["status"] = 'inactive'
 
 cloud_log_manager["address"] = os.getenv('CLOUD_LOG_MANAGER_ADDRESS', '')
 cloud_log_manager["tenant"] = os.getenv('CLOUD_LOG_MANAGER_TENANT', '')
@@ -39,13 +39,13 @@ except:
 syslog = {}
 
 response = subprocess.run(['systemctl', '--user', 'is-active', 'syslog-forwarder'], capture_output=True, text=True)
-match response.stdout:
+match response.stdout.strip():
     case 'active':
         syslog["status"] = 'active'
-    case 'inactive':
-        syslog["status"] = 'inactive'
     case 'failed':
         syslog["status"] = 'failed'
+    case _:
+        syslog["status"] = 'inactive'
 
 syslog["address"] = os.getenv('SYSLOG_ADDRESS', '')
 syslog["port"] = os.getenv('SYSLOG_PORT', '')
