@@ -26,7 +26,7 @@ if (request['active']):
 
     # If process is running, restart with new env variables, otherwise enable it
     response = subprocess.run(['systemctl', '--user', 'is-active', 'syslog-forwarder'], capture_output=True, text=True)
-    if response.stdout in ['active', 'failed']:
+    if response.stdout.strip() in ['active', 'failed']:
         action = 'restart'
     else:
         action = 'enable'
