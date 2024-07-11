@@ -65,6 +65,9 @@ else:
     last_timestamp = START_TIME
     agent.unset_env('SYSLOG_START_TIME')
 
+    if os.path.exists("./syslog_last_timestamp"):
+        os.remove("./syslog_last_timestamp")
+
 # Every x seconds execute logcli command and send logs to syslog server
 while True:
     try:
@@ -79,6 +82,17 @@ while True:
                     json_object = json.loads(log)
                     line = json.loads(json_object["line"])
 
+                    # Set facility value
+                    try:
+                        facility = int(line["SYSLOG_FACILITY"])
+                    except:
+                        facility = transports.get(line["_TRANSPORT"], 18)
+
+                    if "PRIORITY" not in line:
+                        line["PRIORITY"] = 6
+
+                    log_pri=(facility * 8) + int(line["PRIORITY"])
+
                     # Format log based on rfc format
                     if FORMAT == "rfc3164":
                         if "_HOSTNAME" not in line:
@@ -90,31 +104,21 @@ while True:
                         if "_PID" not in line:
                             line["_PID"] = ""
 
-                        # Set facility value
-                        try:
-                            facility = int(line["SYSLOG_FACILITY"])
-                        except:
-                            facility = transports.get(line["_TRANSPORT"], 18)
-
-                        if "PRIORITY" not in line:
-                            line["PRIORITY"] = 6
-
-                        log_priority=(facility * 8) + int(line["PRIORITY"])
-
                         # Format message
-                        message = "<{priority}>{timestamp} {hostname} {process}[{pid}]: {message}".format(priority=log_priority,
-                                                                                                            timestamp=json_object["timestamp"], 
-                                                                                                            hostname=line["_HOSTNAME"],
-                                                                                                            process=line["SYSLOG_IDENTIFIER"],
-                                                                                                            pid=line["_PID"],
-                                                                                                            message=line["MESSAGE"])
+                        message = "<{pri}>{timestamp} {hostname} {process}[{pid}]: {message}".format(pri=log_pri,
+                                                                                                        timestamp=datetime.strftime(datetime.strptime(json_object["timestamp"], '%Y-%m-%dT%H:%M:%S.%fZ'), '%b %d %H:%M:%S'),
+                                                                                                        hostname=line["_HOSTNAME"],
+                                                                                                        process=line["SYSLOG_IDENTIFIER"],
+                                                                                                        pid=line["_PID"],
+                                                                                                        message=line["MESSAGE"])
                     elif FORMAT == "rfc5424":
                         # Format message
-                        message = "{timestamp} {hostname} {process}[{pid}]: {message}".format(timestamp=json_object["timestamp"], 
-                                                                                                hostname=line["_HOSTNAME"],
-                                                                                                process=line["SYSLOG_IDENTIFIER"],
-                                                                                                pid=line["_PID"],
-                                                                                                message=line["MESSAGE"])
+                        message = "<{pri}>1 {timestamp} {hostname} {process} {pid} - - {message}".format(pri=log_pri,
+                                                                                                        timestamp=datetime.strptime(json_object["timestamp"], '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc).isoformat(),
+                                                                                                        hostname=line["_HOSTNAME"],
+                                                                                                        process=line["SYSLOG_IDENTIFIER"],
+                                                                                                        pid=line["_PID"],
+                                                                                                        message=line["MESSAGE"])
 
                     # Control if log has newline characters to avoid overlapping
                     if message.find("\n") == -1:
