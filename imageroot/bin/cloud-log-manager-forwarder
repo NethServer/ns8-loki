@@ -36,7 +36,7 @@ except Exception as exc:
 #--------------------------------- CODE ---------------------------------#
 
 # Send log to gigasys server
-def send_logs_list(logs_list: list, last_timestamp: str):
+def send_logs_list(logs_list: list):
     session = Session()
     retries = Retry(
         backoff_factor=0.5,
@@ -44,19 +44,6 @@ def send_logs_list(logs_list: list, last_timestamp: str):
     session.mount('https://', HTTPAdapter(max_retries=retries))
     session.post(ADDRESS + "/adm/syslog/noauth_put_json/", verify=True, data=json.dumps(logs_list))
     session.close()
-
-    # Write on file the last log sent timestamp
-    with open("./cloud_log_manager_last_timestamp", "w") as tf:
-        tf.write(last_timestamp)
-
-# Define transport facility
-transports = {
-    'kernel': 0,
-    'driver': 3,
-    'audit': 13,
-    'journal': 16,
-    'stdout': 17
-}
 
 # Define severity
 severity = {
@@ -81,14 +68,20 @@ else:
     last_timestamp = START_TIME
     agent.unset_env('CLOUD_LOG_MANAGER_START_TIME')
 
+    if os.path.exists("./cloud_log_manager_last_timestamp"):
+        os.remove("./cloud_log_manager_last_timestamp")
+
 logs_list = []
 
 while True:
     try:
         # LogCLI command
         logcli_command = ["logcli", "query", "--limit", "0", "--forward", "--timezone", "UTC", "--from", last_timestamp, "--no-labels", "-q", "-o", "jsonl",
-                          '{node_id=~".+"} | json severity="PRIORITY", priority="SYSLOG_IDENTIFIER", pid="_PID", message="MESSAGE" | line_format "<{{.priority}}> [{{.node_id}}:{{.module_id}}:{{.process}}] {{.process}}[{{.pid}}]: {{.message}}"']
+                          '{node_id=~".+"} | json identifier="SYSLOG_IDENTIFIER", priority="PRIORITY", message="MESSAGE" | line_format "<{{.priority}}> [{{.node_id}}:{{.module_id}}:{{.identifier}}]: {{.message}}"']
         response = subprocess.run(logcli_command, capture_output=True, text=True)
+
+        last_timestamp_changed = False
+
         for log in response.stdout.splitlines():
             try:
                 # Log if stdout contains something new
@@ -96,21 +89,20 @@ while True:
                     json_object = json.loads(log)
                     line = str(json_object["line"])
 
-                    # Check if priority is set
-                    try:
-                        priority = int(line[line.find("<")+1:line.find(">")])
-                    except:
-                        priority = 6
+                    if line[line.find(":")+1:line.find(":", line.find(":")+1)] != '':
+                        source = line[line.find(":")+1:line.find(":", line.find(":")+1)]
+                    else:
+                        source = f'node{line[line.find("[")+1:line.find(":")]}'
 
                     # Json data for post request
                     json_log = {
                         "UUID": UUID,
                         "PC": HOSTNAME,
-                        "DTA": datetime.strptime(json_object["timestamp"], '%Y-%m-%dT%H:%M:%S.%fZ').strftime("%Y-%m-%d"),
+                        "DTA": datetime.strptime(json_object["timestamp"], '%Y-%m-%dT%H:%M:%S.%fZ').strftime("%Y%m%d"),
                         "TIME": datetime.strptime(json_object["timestamp"], '%Y-%m-%dT%H:%M:%S.%fZ').strftime("%H:%M:%S"),
-                        "MSG": line[line.find("]")+2:],
-                        "SOURCE": line[line.find("["):line.find("]")+1],
-                        "LOGTYPE": severity.get(priority, 6),
+                        "MSG": line[line.find("["):],
+                        "SOURCE": source,
+                        "LOGTYPE": severity.get(line[line.find("<")+1:line.find(">")], 'Information'),
                         "SITE": TENANT
                     }
 
@@ -119,22 +111,28 @@ while True:
                     # Save log timestamp only when socket send succeed
                     last_timestamp = json_object["timestamp"]
 
-                    # If list size is bigger than 128 kB, send
-                    if sys.getsizeof(logs_list) >= 131072:
-                        send_logs_list(logs_list, last_timestamp)
+                    # Send if list size is bigger than 16 kB
+                    if sys.getsizeof(logs_list) >= 16384:
+                        send_logs_list(logs_list)
                         logs_list.clear()
+                        last_timestamp_changed = True
             except Exception as exc:
                 print(f"Error on log format: {exc}", file=sys.stderr)
                 pass
 
         # When loop terminate, if list isn't empty, send
         if len(logs_list) > 0:
-            # Increment timestamp by 1 microsecond to prevent sending the same log multiple times
-            last_timestamp = (datetime.strptime(last_timestamp, '%Y-%m-%dT%H:%M:%S.%fZ') + timedelta(microseconds=1)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-
             # Send logs to gigasys server
-            send_logs_list(logs_list, last_timestamp)
+            send_logs_list(logs_list)
             logs_list.clear()
+            last_timestamp_changed = True
+
+        last_timestamp = (datetime.strptime(last_timestamp, '%Y-%m-%dT%H:%M:%S.%fZ') + timedelta(microseconds=1)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+        # Write on file the last log sent timestamp incrementing timestamp by 1 microsecond to prevent sending the same log multiple times
+        if last_timestamp_changed:
+            with open("./cloud_log_manager_last_timestamp", "w") as tf:
+                tf.write(last_timestamp)
 
     except Exception as exc:
         print(f"Error during loop: {exc}", file=sys.stderr)
