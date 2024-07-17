@@ -11,13 +11,18 @@ import os
 import json
 import sys
 import subprocess
+import agent
 
 # Cloud Log Manager
 
-cloud_log_manager = {}
+rdb = agent.redis_connect()
 
-response = subprocess.run(['systemctl', '--user', 'is-active', 'cloud-log-manager-forwarder'], capture_output=True, text=True)
-match response.stdout.strip():
+cloud_log_manager = {}
+module_id = os.environ['MODULE_ID']
+cloud_log_manager['cluster_id'] = rdb.hget(f'module/{module_id}/environment', 'CLOUD_LOG_MANAGER_HOSTNAME') or ""
+
+clm_status = subprocess.run(['systemctl', '--user', 'is-active', 'cloud-log-manager-forwarder'], capture_output=True, text=True)
+match clm_status.stdout.strip():
     case 'active':
         cloud_log_manager["status"] = 'active'
     case 'failed':
@@ -38,8 +43,8 @@ except:
 
 syslog = {}
 
-response = subprocess.run(['systemctl', '--user', 'is-active', 'syslog-forwarder'], capture_output=True, text=True)
-match response.stdout.strip():
+syslog_status = subprocess.run(['systemctl', '--user', 'is-active', 'syslog-forwarder'], capture_output=True, text=True)
+match syslog_status.stdout.strip():
     case 'active':
         syslog["status"] = 'active'
     case 'failed':
