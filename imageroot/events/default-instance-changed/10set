@@ -39,9 +39,7 @@ if os.getenv("AGENT_EVENT_SOURCE") == 'cluster':
                             stdout=sys.stderr,
                             stderr=sys.stderr,
                             check=True)
-            
-            agent.unset_env('CLOUD_LOG_MANAGER_HOSTNAME')
-                
+
         # New instance
         if 'current' in data and data['current'] == os.getenv('MODULE_ID'):
             rdb = agent.redis_connect()
@@ -49,11 +47,7 @@ if os.getenv("AGENT_EVENT_SOURCE") == 'cluster':
             subscription = rdb.hgetall('cluster/subscription')
 
             # If cloud log manager service was active in old instance, start on new instacnce
-            if all(key in previous_environment for key in ('CLOUD_LOG_MANAGER_ADDRESS', 'CLOUD_LOG_MANAGER_TENANT', 'CLOUD_LOG_MANAGER_UUID')) and bool(subscription):
-                cluster_uuid = rdb.get('cluster/uuid')
-                
-                agent.set_env('CLOUD_LOG_MANAGER_UUID', previous_environment['CLOUD_LOG_MANAGER_UUID'])
-                agent.set_env('CLOUD_LOG_MANAGER_HOSTNAME', 'cluster-' + hashlib.sha256(cluster_uuid.encode("utf-8")).hexdigest()[:8])
+            if all(key in previous_environment for key in ('CLOUD_LOG_MANAGER_ADDRESS', 'CLOUD_LOG_MANAGER_TENANT')) and bool(subscription):
                 agent.set_env('CLOUD_LOG_MANAGER_ADDRESS', previous_environment['CLOUD_LOG_MANAGER_ADDRESS'])
                 agent.set_env('CLOUD_LOG_MANAGER_TENANT', previous_environment['CLOUD_LOG_MANAGER_TENANT'])
 

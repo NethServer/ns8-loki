@@ -8,10 +8,10 @@
 import agent
 import os
 import datetime
+import uuid
 
 def genuuid():
-    uuid =  os.popen("uuidgen")
-    return uuid.read()
+    return str(uuid.uuid4()) # random UUID generation
 
 node_id = os.environ['NODE_ID']
 port = os.environ['TCP_PORT']
@@ -19,6 +19,8 @@ port = os.environ['TCP_PORT']
 rdb = agent.redis_connect()
 rkey = f'node/{node_id}/vpn'
 ip_address = rdb.hget(rkey, 'ip_address')
+# Keep the cluster UUID private, use an hash of it instead:
+clm_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, rdb.get('cluster/uuid') or genuuid()))
 
 # Discover the currently active Loki instance
 active_agent = agent.resolve_agent_id("loki@cluster") or os.environ["AGENT_ID"]
@@ -33,3 +35,5 @@ agent.set_env('LOKI_LOGS_INGRESS_TOKEN', genuuid())
 agent.set_env('LOKI_HTTP_PORT', port)
 agent.set_env('LOKI_RETENTION_PERIOD', initial_retention)
 agent.set_env('LOKI_ACTIVE_FROM', datetime.datetime.now().astimezone().isoformat())
+agent.set_env('CLOUD_LOG_MANAGER_UUID', clm_uuid)
+agent.set_env('CLOUD_LOG_MANAGER_HOSTNAME', 'cluster-' + clm_uuid[:8])
