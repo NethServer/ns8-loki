@@ -13,7 +13,6 @@ import subprocess
 data = json.load(sys.stdin)
 
 if data['action'] == 'terminated':
-    agent.unset_env('CLOUD_LOG_MANAGER_UUID')
     agent.unset_env('CLOUD_LOG_MANAGER_START_TIME')
     agent.unset_env('CLOUD_LOG_MANAGER_ADDRESS')
     agent.unset_env('CLOUD_LOG_MANAGER_TENANT')

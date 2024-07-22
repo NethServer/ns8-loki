@@ -7,8 +7,10 @@
 
 import datetime
 import os
-
+import uuid
 import agent
+
+rdb = agent.redis_connect()
 
 # Set environment variables
 if os.getenv('LOKI_ACTIVE_FROM') is None:
@@ -16,3 +18,9 @@ if os.getenv('LOKI_ACTIVE_FROM') is None:
     agent.set_env('LOKI_ACTIVE_FROM', datetime.datetime.fromtimestamp(os.stat('environment').st_mtime).astimezone().isoformat())
 if os.getenv('LOKI_RETENTION_PERIOD') is None:
     agent.set_env('LOKI_RETENTION_PERIOD', '365')
+
+# Versions before 1.2 need to set new variables for Cloud Log Manager:
+if os.getenv('CLOUD_LOG_MANAGER_UUID') is None:
+    clm_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, rdb.get('cluster/uuid') or str(uuid.uuid4())))
+    agent.set_env('CLOUD_LOG_MANAGER_UUID', clm_uuid)
+    agent.set_env('CLOUD_LOG_MANAGER_HOSTNAME', 'cluster-' + clm_uuid[:8])
