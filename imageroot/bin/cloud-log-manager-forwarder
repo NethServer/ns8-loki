@@ -76,7 +76,7 @@ logs_list = []
 while True:
     try:
         # LogCLI command
-        logcli_command = ["logcli", "query", "--limit", "0", "--forward", "--timezone", "UTC", "--from", last_timestamp, "--no-labels", "-q", "-o", "jsonl",
+        logcli_command = ["logcli", "query", "--limit", "2000", "--forward", "--timezone", "UTC", "--from", last_timestamp, "--no-labels", "-q", "-o", "jsonl",
                           '{node_id=~".+"} | json identifier="SYSLOG_IDENTIFIER", priority="PRIORITY", message="MESSAGE" | line_format "<{{.priority}}> [{{.node_id}}:{{.module_id}}:{{.identifier}}]: {{.message}}"']
         response = subprocess.run(logcli_command, capture_output=True, text=True, timeout=300)
 
