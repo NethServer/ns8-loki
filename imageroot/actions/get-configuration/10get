@@ -32,6 +32,7 @@ match clm_status.stdout.strip():
 
 cloud_log_manager["address"] = os.getenv('CLOUD_LOG_MANAGER_ADDRESS', '')
 cloud_log_manager["tenant"] = os.getenv('CLOUD_LOG_MANAGER_TENANT', '')
+cloud_log_manager["filter"] = os.getenv('CLOUD_LOG_MANAGER_FILTER', '')
 
 try: 
     with open("./cloud_log_manager_last_timestamp", "r") as clm_file:
@@ -55,6 +56,7 @@ match syslog_status.stdout.strip():
 syslog["address"] = os.getenv('SYSLOG_ADDRESS', '')
 syslog["port"] = os.getenv('SYSLOG_PORT', '')
 syslog["protocol"] = os.getenv('SYSLOG_PROTOCOL', '')
+syslog["filter"] = os.getenv('SYSLOG_FILTER', '')
 syslog["format"] = os.getenv('SYSLOG_FORMAT', '')
 
 try:

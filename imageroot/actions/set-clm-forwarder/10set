@@ -6,10 +6,8 @@
 #
 
 import subprocess
-import hashlib
 import agent
 import json
-import uuid
 import sys
 
 request = json.load(sys.stdin)
@@ -24,6 +22,7 @@ if not bool(subscription):
 if (request['active']):
     agent.set_env('CLOUD_LOG_MANAGER_ADDRESS', f"{request['address']}")
     agent.set_env('CLOUD_LOG_MANAGER_TENANT', f"{request['tenant']}")
+    agent.set_env('CLOUD_LOG_MANAGER_FILTER', f"{request['filter']}")
 
     if 'start_time' in request and request['start_time'] != '':
         agent.set_env('CLOUD_LOG_MANAGER_START_TIME', f"{request['start_time']}")
@@ -38,6 +37,7 @@ else:
     agent.unset_env('CLOUD_LOG_MANAGER_START_TIME')
     agent.unset_env('CLOUD_LOG_MANAGER_ADDRESS')
     agent.unset_env('CLOUD_LOG_MANAGER_TENANT')
+    agent.unset_env('CLOUD_LOG_MANAGER_FILTER')
 
     action = 'disable'
 
