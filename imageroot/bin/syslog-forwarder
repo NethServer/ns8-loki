@@ -23,6 +23,7 @@ try:
     PROTOCOL = os.environ.get('SYSLOG_PROTOCOL', 'udp')
     FORMAT = os.environ.get('SYSLOG_FORMAT', 'rfc3164')
     START_TIME = os.environ.get('SYSLOG_START_TIME', '')
+    FILTER = os.environ.get('SYSLOG_FILTER')
 
     os.environ['LOKI_ADDR'] = f"http://127.0.0.1:{os.environ['LOKI_HTTP_PORT']}"
     os.environ['LOKI_USERNAME'] = os.environ['LOKI_API_AUTH_USERNAME']
@@ -73,13 +74,18 @@ while True:
     try:
         # LogCLI command
         logcli_command = ["logcli", "query", "--limit", "0", "--forward", "--timezone", "UTC", 
-                          "--from", last_timestamp, "--no-labels", "-q", "-o", "jsonl", '{node_id=~".+"}']
+                          "--from", last_timestamp, "-q", "-o", "jsonl", '{node_id=~".+"}']
         response = subprocess.run(logcli_command, capture_output=True, text=True)
         for log in response.stdout.splitlines():
             try:
                 # Log if stdout contains something new
                 if log:
                     json_object = json.loads(log)
+                    labels = json_object["labels"]
+
+                    if FILTER != None and FILTER not in labels:
+                        continue
+
                     line = json.loads(json_object["line"])
 
                     # Set facility value

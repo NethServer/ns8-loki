@@ -20,6 +20,7 @@ if (request['active']):
     agent.set_env('SYSLOG_PORT', f"{request['port']}")
     agent.set_env('SYSLOG_PROTOCOL', f"{request['protocol']}")
     agent.set_env('SYSLOG_FORMAT', f"{request['format']}")
+    agent.set_env('SYSLOG_FILTER', f"{request['filter']}")
 
     if 'start_time' in request and request['start_time'] != '':
         agent.set_env('SYSLOG_START_TIME', f"{request['start_time']}")
@@ -36,6 +37,7 @@ else:
     agent.unset_env('SYSLOG_PROTOCOL')
     agent.unset_env('SYSLOG_FORMAT')
     agent.unset_env('SYSLOG_START_TIME')
+    agent.unset_env('SYSLOG_FILTER')
 
     action = 'disable'
 
