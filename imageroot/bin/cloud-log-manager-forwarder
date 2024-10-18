@@ -25,6 +25,7 @@ try:
     START_TIME = os.environ.get('CLOUD_LOG_MANAGER_START_TIME', '')
     ADDRESS = os.environ.get('CLOUD_LOG_MANAGER_ADDRESS', 'https://nar.nethesis.it')
     TENANT = os.environ.get('CLOUD_LOG_MANAGER_TENANT')
+    FILTER = os.environ.get('CLOUD_LOG_MANAGER_FILTER')
 
     os.environ['LOKI_ADDR'] = f"http://127.0.0.1:{os.environ['LOKI_HTTP_PORT']}"
     os.environ['LOKI_USERNAME'] = os.environ['LOKI_API_AUTH_USERNAME']
@@ -76,7 +77,7 @@ logs_list = []
 while True:
     try:
         # LogCLI command
-        logcli_command = ["logcli", "query", "--limit", "2000", "--forward", "--timezone", "UTC", "--from", last_timestamp, "--no-labels", "-q", "-o", "jsonl",
+        logcli_command = ["logcli", "query", "--limit", "2000", "--forward", "--timezone", "UTC", "--from", last_timestamp, "-q", "-o", "jsonl",
                           '{node_id=~".+"} | json identifier="SYSLOG_IDENTIFIER", priority="PRIORITY", message="MESSAGE" | line_format "<{{.priority}}> [{{.node_id}}:{{.module_id}}:{{.identifier}}]: {{.message}}"']
         response = subprocess.run(logcli_command, capture_output=True, text=True, timeout=300)
 
@@ -87,6 +88,11 @@ while True:
                 # Log if stdout contains something new
                 if log:
                     json_object = json.loads(log)
+                    labels = json_object["labels"]
+
+                    if FILTER != None and FILTER not in labels:
+                        continue
+
                     line = str(json_object["line"])
 
                     if line[line.find(":")+1:line.find(":", line.find(":")+1)] != '':
