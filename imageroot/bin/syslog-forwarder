@@ -69,12 +69,16 @@ else:
     if os.path.exists("./syslog_last_timestamp"):
         os.remove("./syslog_last_timestamp")
 
+logql_stream_selector = ' {node_id=~".+"}'
+if FILTER != None:
+    logql_stream_selector = ' {node_id=~".+",category="' + FILTER + '"}'
+
 # Every x seconds execute logcli command and send logs to syslog server
 while True:
     try:
         # LogCLI command
         logcli_command = ["logcli", "query", "--limit", "0", "--forward", "--timezone", "UTC", 
-                          "--from", last_timestamp, "-q", "-o", "jsonl", '{node_id=~".+"}']
+                          "--from", last_timestamp, "--no-labels", "-q", "-o", "jsonl", logql_stream_selector]
         response = subprocess.run(logcli_command, capture_output=True, text=True)
         for log in response.stdout.splitlines():
             try:
