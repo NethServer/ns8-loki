@@ -70,7 +70,7 @@ else:
         os.remove("./syslog_last_timestamp")
 
 logql_stream_selector = ' {node_id=~".+"}'
-if FILTER != None:
+if FILTER:
     logql_stream_selector = ' {node_id=~".+",category="' + FILTER + '"}'
 
 # Every x seconds execute logcli command and send logs to syslog server
@@ -85,10 +85,6 @@ while True:
                 # Log if stdout contains something new
                 if log:
                     json_object = json.loads(log)
-                    labels = json_object["labels"]
-
-                    if FILTER != None and FILTER not in labels:
-                        continue
 
                     line = json.loads(json_object["line"])
 

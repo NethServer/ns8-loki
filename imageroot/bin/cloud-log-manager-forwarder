@@ -75,7 +75,7 @@ else:
 logs_list = []
 
 logql_stream_selector = ' {node_id=~".+"} '
-if FILTER != None:
+if FILTER:
     logql_stream_selector = ' {node_id=~".+",category="' + FILTER + '"} '
 
 while True:
