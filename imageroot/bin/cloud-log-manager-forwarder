@@ -92,7 +92,6 @@ while True:
                 # Log if stdout contains something new
                 if log:
                     json_object = json.loads(log)
-
                     line = str(json_object["line"])
 
                     if line[line.find(":")+1:line.find(":", line.find(":")+1)] != '':

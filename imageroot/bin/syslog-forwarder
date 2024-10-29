@@ -85,7 +85,6 @@ while True:
                 # Log if stdout contains something new
                 if log:
                     json_object = json.loads(log)
-
                     line = json.loads(json_object["line"])
 
                     # Set facility value
