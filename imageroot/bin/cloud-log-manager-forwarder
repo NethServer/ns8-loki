@@ -25,6 +25,7 @@ try:
     START_TIME = os.environ.get('CLOUD_LOG_MANAGER_START_TIME', '')
     ADDRESS = os.environ.get('CLOUD_LOG_MANAGER_ADDRESS', 'https://nar.nethesis.it')
     TENANT = os.environ.get('CLOUD_LOG_MANAGER_TENANT')
+    FILTER = os.environ.get('CLOUD_LOG_MANAGER_FILTER')
 
     os.environ['LOKI_ADDR'] = f"http://127.0.0.1:{os.environ['LOKI_HTTP_PORT']}"
     os.environ['LOKI_USERNAME'] = os.environ['LOKI_API_AUTH_USERNAME']
@@ -73,11 +74,15 @@ else:
 
 logs_list = []
 
+logql_stream_selector = ' {node_id=~".+"} '
+if FILTER:
+    logql_stream_selector = ' {node_id=~".+",category="' + FILTER + '"} '
+
 while True:
     try:
         # LogCLI command
         logcli_command = ["logcli", "query", "--limit", "2000", "--forward", "--timezone", "UTC", "--from", last_timestamp, "--no-labels", "-q", "-o", "jsonl",
-                          '{node_id=~".+"} | json identifier="SYSLOG_IDENTIFIER", priority="PRIORITY", message="MESSAGE" | line_format "<{{.priority}}> [{{.node_id}}:{{.module_id}}:{{.identifier}}]: {{.message}}"']
+                          logql_stream_selector + '| json identifier="SYSLOG_IDENTIFIER", priority="PRIORITY", message="MESSAGE" | line_format "<{{.priority}}> [{{.node_id}}:{{.module_id}}:{{.identifier}}]: {{.message}}"']
         response = subprocess.run(logcli_command, capture_output=True, text=True, timeout=300)
 
         last_timestamp_changed = False

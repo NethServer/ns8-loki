@@ -52,6 +52,10 @@
                 "cluster_id": {
                     "type": "string",
                     "description": "Key that identify cluster on Cloud Log Manager."
+                },
+                "filter": {
+                    "type": "string",
+                    "description": "Log filter type."
                 }
             }
 
@@ -86,6 +90,10 @@
                 "last_timestamp": {
                     "type": "string",
                     "description": "Timestamp of the last log sent."
+                },
+                "filter": {
+                    "type": "string",
+                    "description": "Log filter type."
                 }
             }
         }
