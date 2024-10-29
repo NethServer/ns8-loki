@@ -11,6 +11,7 @@ buildah add "${container}" imageroot /imageroot
 buildah add "${container}" ui /ui
 buildah config --entrypoint=/ \
 	--label="org.nethserver.images=docker.io/traefik:v2.11.6 docker.io/grafana/loki:2.9.10" \
+    --label="org.nethserver.min-core=3.1.4-0" \
 	--label="org.nethserver.tcp-ports-demand=1" \
     --label='org.nethserver.flags=core_module' \
 	"${container}"
