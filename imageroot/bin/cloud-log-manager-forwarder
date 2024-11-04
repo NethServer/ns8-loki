@@ -25,7 +25,7 @@ try:
     START_TIME = os.environ.get('CLOUD_LOG_MANAGER_START_TIME', '')
     ADDRESS = os.environ.get('CLOUD_LOG_MANAGER_ADDRESS', 'https://nar.nethesis.it')
     TENANT = os.environ.get('CLOUD_LOG_MANAGER_TENANT')
-    FILTER = os.environ.get('CLOUD_LOG_MANAGER_FILTER')
+    FILTER = os.environ.get('CLOUD_LOG_MANAGER_FILTER', 'security')
 
     os.environ['LOKI_ADDR'] = f"http://127.0.0.1:{os.environ['LOKI_HTTP_PORT']}"
     os.environ['LOKI_USERNAME'] = os.environ['LOKI_API_AUTH_USERNAME']
