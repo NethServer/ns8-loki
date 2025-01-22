@@ -11,11 +11,9 @@ import json
 import sys
 import subprocess
 
-# Cloud Log Manager
-
 info = {
     "retention_days": int(os.getenv('LOKI_RETENTION_PERIOD')),
-    "cloud_log_manager": subprocess.check_output(['systemctl', '--user', 'is-enabled', 'cloud-log-manager-forwarder']).strip(),
-    "syslog": subprocess.check_output(['systemctl', '--user', 'is-enabled', 'syslog-forwarder']).strip(),
+    "cloud_log_manager": subprocess.run(['systemctl', '--user', 'is-enabled', 'cloud-log-manager-forwarder'], check=False, capture_output=True).returncode == 0,
+    "syslog": subprocess.run(['systemctl', '--user', 'is-enabled', 'syslog-forwarder'], check=False, capture_output=True).returncode == 0,
 }
 json.dump(info, sys.stdout)
