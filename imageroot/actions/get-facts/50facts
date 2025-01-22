@@ -16,29 +16,7 @@ import subprocess
 
 info = {
     "retention_days": int(os.getenv('LOKI_RETENTION_PERIOD')),
-    "cloud_log_manager": "",
-    "syslog": ""
+    "cloud_log_manager": subprocess.check_output(['systemctl', '--user', 'is-enabled', 'cloud-log-manager-forwarder']).strip(),
+    "syslog": subprocess.check_output(['systemctl', '--user', 'is-enabled', 'syslog-forwarder']).strip(),
 }
-
-clm_status = subprocess.run(['systemctl', '--user', 'is-active', 'cloud-log-manager-forwarder'], capture_output=True, text=True)
-match clm_status.stdout.strip():
-    case 'active':
-        info["cloud_log_manager"] = 'active'
-    case 'failed':
-        info["cloud_log_manager"] = 'failed'
-    case _:
-        info["cloud_log_manager"] = 'inactive'
-
-
-# Syslog
-
-syslog_status = subprocess.run(['systemctl', '--user', 'is-active', 'syslog-forwarder'], capture_output=True, text=True)
-match syslog_status.stdout.strip():
-    case 'active':
-        info["syslog"] = 'active'
-    case 'failed':
-        info["syslog"] = 'failed'
-    case _:
-        info["syslog"] = 'inactive'
-
 json.dump(info, sys.stdout)
