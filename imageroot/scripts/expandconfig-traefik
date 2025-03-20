@@ -23,6 +23,8 @@
 set -e
 
 cat >traefik.yaml <<EOF
+core:
+  defaultRuleSyntax: v2
 http:
   routers:
     loki-log-ingress:
