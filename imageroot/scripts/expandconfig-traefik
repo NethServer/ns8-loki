@@ -26,7 +26,7 @@ cat >traefik.yaml <<EOF
 http:
   routers:
     loki-log-ingress:
-      rule: "Path(\`/loki/api/v1/push\`) && Headers(\`Authorization\`, \`Bearer ${LOKI_LOGS_INGRESS_TOKEN}\`)"
+      rule: "Path(\`/loki/api/v1/push\`) && Header(\`Authorization\`, \`Bearer ${LOKI_LOGS_INGRESS_TOKEN}\`)"
       service: loki
     loki-api:
       rule: "PathPrefix(\`/\`)"
