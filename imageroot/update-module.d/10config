@@ -24,3 +24,8 @@ if os.getenv('CLOUD_LOG_MANAGER_UUID') is None:
     clm_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, rdb.get('cluster/uuid') or str(uuid.uuid4())))
     agent.set_env('CLOUD_LOG_MANAGER_UUID', clm_uuid)
     agent.set_env('CLOUD_LOG_MANAGER_HOSTNAME', 'cluster-' + clm_uuid[:8])
+
+if os.getenv('LOKI_V13_SCHEMA_START') is None:
+    # Set the default value for LOKI_V13_SCHEMA_START, which is the day after the current date
+    agent.set_env('LOKI_V13_SCHEMA_START', (datetime.date.today() + datetime.timedelta(days=1)).isoformat())
+    agent.set_env('LOKI_ALLOW_STRUCTURED_METADATA', 'false') # this could be manually set to true after LOKI_V13_SCHEMA_START date
