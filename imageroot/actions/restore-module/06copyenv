@@ -8,7 +8,6 @@
 import sys
 import json
 import agent
-import os
 
 request = json.load(sys.stdin)
 
@@ -17,6 +16,8 @@ original_environment = request['environment']
 for evar in [
         "LOKI_RETENTION_PERIOD",
         "LOKI_ACTIVE_FROM",
+        "LOKI_V13_SCHEMA_START",
+        "LOKI_ALLOW_STRUCTURED_METADATA"
         # NOTE: LOKI_ACTIVE_TO is restored by a later step
     ]:
     agent.set_env(evar, original_environment[evar])
