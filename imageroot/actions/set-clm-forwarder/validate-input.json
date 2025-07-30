@@ -11,6 +11,7 @@
         },
         "address": {
             "type": "string",
+            "format": "uri",
             "description": "Cloud log manager server address."
         },
         "tenant": {
