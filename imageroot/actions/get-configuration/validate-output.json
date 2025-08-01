@@ -38,11 +38,8 @@
                     "description": "Forwarder state."
                 },
                 "address": {
-                    "description": "Forwarder address where datas are sent.",
-                    "oneOf": [
-                        { "type": "string", "format": "uri" },
-                        { "type": "string", "maxLength": 0 }
-                    ]
+                    "type": "string",
+                    "description": "Forwarder address where datas are sent."
                 },
                 "tenant": {
                     "type": "string",
