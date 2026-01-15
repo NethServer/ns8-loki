@@ -11,12 +11,14 @@ import agent
 
 module_id = os.environ['MODULE_ID']
 agent_id = os.environ['AGENT_ID']
-node_id = int(os.environ['NODE_ID'])
 
 def main():
-    global module_id, node_id
+    global module_id
+    node_id = int(os.environ['NODE_ID'])
+    rdb_ro = agent.redis_connect()
+    ip_address = rdb_ro.hget(f'node/{node_id}/vpn', 'ip_address') or '127.0.0.1'
     targets = [{
-        "targets": [f"127.0.0.1:{os.environ['TCP_PORT']}"],
+        "targets": [f"{ip_address}:{os.environ['TCP_PORT']}"],
         "labels": {
             "module_id": module_id,
             "node": node_id, # no "_id" suffix for Metrics
