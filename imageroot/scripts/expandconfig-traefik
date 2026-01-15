@@ -28,6 +28,10 @@ http:
     loki-log-ingress:
       rule: "Path(\`/loki/api/v1/push\`) && Header(\`Authorization\`, \`Bearer ${LOKI_LOGS_INGRESS_TOKEN}\`)"
       service: loki
+    loki-metrics:
+      rule: "PathPrefix(\`/metrics\`)"
+      service: loki
+      priority: 100
     loki-api:
       rule: "PathPrefix(\`/\`)"
       service: loki
