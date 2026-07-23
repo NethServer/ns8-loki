@@ -5,7 +5,7 @@ After=loki-server.service
 
 [Service]
 Restart=always
-ExecStart=runagent %S/bin/cloud-log-manager-forwarder
+ExecStart=runagent %E/bin/cloud-log-manager-forwarder
 
 [Install]
 WantedBy=default.target

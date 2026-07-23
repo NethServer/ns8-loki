@@ -5,10 +5,10 @@ After=loki.service
 
 [Service]
 Environment=PODMAN_SYSTEMD_UNIT=%n
-EnvironmentFile=%S/state/environment
+EnvironmentFile=%E/state/environment
 Restart=always
 ExecStartPre=/bin/rm -f %t/traefik.pid %t/traefik.ctr-id
-ExecStartPre=%S/scripts/expandconfig-traefik
+ExecStartPre=%E/scripts/expandconfig-traefik
 ExecStart=/usr/bin/podman run \
     --detach \
     --conmon-pidfile=%t/traefik.pid \
@@ -25,7 +25,7 @@ ExecStop=/usr/bin/podman stop --ignore --cidfile %t/traefik.ctr-id -t 10
 ExecStopPost=/usr/bin/podman rm --ignore -f --cidfile %t/traefik.ctr-id
 PIDFile=%t/traefik.pid
 Type=forking
-WorkingDirectory=%S/state
+WorkingDirectory=%E/state
 
 [Install]
 WantedBy=default.target
