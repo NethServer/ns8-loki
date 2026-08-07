@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2026 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+import json
+import subprocess
+import sys
+
+import agent
+
+request = json.load(sys.stdin)
+
+if request['active']:
+    # Unlike set-clm-forwarder, a missing subscription does not abort the
+    # action: the collector re-reads cluster/subscription from Redis at each
+    # fire, so a subscription registered later starts working with no
+    # reconfiguration here.
+    subscription = agent.redis_connect().hgetall('cluster/subscription')
+    if not subscription:
+        print("No subscription found: bundles will not ship until the node has a subscription",
+              file=sys.stderr)
+
+    agent.set_env('INSIGHTS_SERVER_URL', request['base_url'].rstrip('/'))
+    agent.set_env('INSIGHTS_VERIFY_TLS', '1' if request.get('verify_tls', True) else '0')
+    action = 'enable'
+else:
+    agent.munset_env(['INSIGHTS_SERVER_URL', 'INSIGHTS_VERIFY_TLS'])
+    action = 'disable'
+
+# The unit files may be new to this installation
+subprocess.run(["systemctl", "--user", "daemon-reload"],
+               stdout=sys.stderr,
+               stderr=sys.stderr,
+               text=True,
+               check=True)
+
+# Enable or disable the timer, never the oneshot service. Re-running while
+# active only rewrites the environment: the oneshot reads its environment
+# at each fire, so the timer needs no restart.
+subprocess.run(["systemctl", "--user", action, "--now", "insights-collector.timer"],
+               stdout=sys.stderr,
+               stderr=sys.stderr,
+               text=True,
+               check=True)

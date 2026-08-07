@@ -65,13 +65,38 @@ try:
 except:
     syslog["last_timestamp"] = ""
 
+# Insights
+
+insights = {}
+
+insights_status = subprocess.run(['systemctl', '--user', 'is-active', 'insights-collector.timer'], capture_output=True, text=True)
+match insights_status.stdout.strip():
+    case 'active':
+        insights["status"] = 'active'
+    case 'failed':
+        insights["status"] = 'failed'
+    case _:
+        insights["status"] = 'inactive'
+
+insights["base_url"] = os.getenv('INSIGHTS_SERVER_URL', '')
+insights["verify_tls"] = os.getenv('INSIGHTS_VERIFY_TLS', '1') != '0'
+
+# This is what tells the UI why an enabled collector ships nothing: the
+# collector reads identity from cluster/subscription at run time and has no
+# module secret of its own.
+insights["subscription_configured"] = bool(rdb.hgetall('cluster/subscription'))
+
+insights_last_run = subprocess.run(['systemctl', '--user', 'show', 'insights-collector.service', '-p', 'ExecMainExitTimestamp', '--value'], capture_output=True, text=True)
+insights["last_run"] = insights_last_run.stdout.strip()
+
 # General
 
 response = {
     "retention_days": int(os.getenv('LOKI_RETENTION_PERIOD')),
     "active_from": os.getenv('LOKI_ACTIVE_FROM'),
     "cloud_log_manager": cloud_log_manager,
-    "syslog": syslog
+    "syslog": syslog,
+    "insights": insights
 }
 
 if os.getenv('LOKI_ACTIVE_TO') is not None:

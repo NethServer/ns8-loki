@@ -85,11 +85,124 @@ api-cli run module/loki1/get-configuration
 {
   "retention_days": 7,
   "active_from": "2021-05-28T15:49:27Z+00:00",
-  "active_to": "2021-05-28T15:49:27Z+00:00"
+  "active_to": "2021-05-28T15:49:27Z+00:00",
+  "insights": {
+    "status": "active",
+    "base_url": "https://insights.nethesis.it",
+    "verify_tls": true,
+    "subscription_configured": true,
+    "last_run": "Wed 2026-08-07 14:00:11 UTC"
+  }
 }
 ```
 
 Note: `active_to` field WILL miss if the instance is still active.
+
+### `set-insights`
+
+Configure the insights collector. On its 15-minute timer it collects a window
+of the cluster journal, scrubs likely secrets, masks variable text,
+deduplicates the result into counted templates, and ships the bundle to the
+Nethesis insights service, where the actual (LLM-based) analysis happens.
+The node performs no analysis and holds no LLM credential. Disabled by
+default.
+
+#### Parameters
+
+- `active`: enable or disable `insights-collector.timer`. Required.
+- `base_url`: base URL of the insights server. Required when `active` is
+  `true`.
+- `verify_tls`: verify the server TLS certificate. Optional, default `true`.
+  Set to `false` only for a self-signed test server — never against a
+  production endpoint.
+
+No API key is required or accepted any more. Identity comes from the node's
+existing NethServer subscription: the collector reads `system_id` and its
+secret from the `cluster/subscription` Redis hash at run time and
+authenticates as `Authorization: Basic base64(system_id:secret)`. A node with
+no subscription ships nothing and says so in the journal.
+
+#### Example
+
+```bash
+api-cli run module/loki1/set-insights --data '{
+  "active": true,
+  "base_url": "https://insights.nethesis.it"
+}'
+```
+
+Disable it again:
+
+```bash
+api-cli run module/loki1/set-insights --data '{"active": false}'
+```
+
+#### Findings
+
+Findings are no longer written to the local journal: analysis happens on the
+insights server, and findings are read back through its API, not through this
+module. The node's only journal output is operational, one line per window
+under `SYSLOG_IDENTIFIER=loki1/insights-collector`: a
+`shipped N templates, M lines -> 202` line on success, an error line
+otherwise.
+
+Check the collector's own health with:
+
+```bash
+runagent -m loki1 journalctl --user -u insights-collector
+```
+
+#### Manual execution
+
+The collector is also a plain CLI with three flags, so systemd invokes it
+with none:
+
+```bash
+# See exactly what would leave the node before enabling anything.
+# No subscription needed, no server URL needed, nothing is shipped.
+runagent -m loki1 ../bin/insights-collector --print
+```
+
+`runagent` changes directory to the module state directory, hence the
+`../bin/` prefix.
+
+| Flag | Effect |
+|------|--------|
+| `--print` | build the bundle and write it to stdout instead of shipping; needs no subscription and no server URL |
+| `--max-lines N` | cap on log lines read per window, before deduplication. Default `500` |
+| `--minutes N` | window size in minutes. Default `15` |
+
+A run covers one window and exits. A failure is loud and costs exactly one
+window: the next timer fire retries.
+
+#### Sizing
+
+What ships is deduplicated *templates*, not raw log lines, so the outbound
+volume is far below the raw line count of a window. `--max-lines` caps how
+many lines are read per window before deduplication, 500 by default. Check
+your own figure with `--print` before enabling the timer.
+
+#### Privacy
+
+What leaves the node is masked, deduplicated log templates plus per-module
+counts. A template still carries the fixed text of the log messages it stands
+for — that text is the signal — but the variable parts are replaced and
+identical events collapse into one counted entry, so no line is sent verbatim.
+Two passes run before anything is sent:
+`imageroot/pypkg/insights/scrub.py` removes likely secrets
+(`password=`, `token=`, `api_key=`, `Authorization` headers, long base64
+runs, email addresses), and `imageroot/pypkg/insights/masking.py` replaces
+variable text (timestamps, PIDs, addresses, UUIDs and similar) so that
+repeated events collapse to one template. This is defence in depth, not a
+guarantee.
+
+The destination is the Nethesis insights service, authenticated with the
+subscription identity (`system_id` and secret) the node already holds —
+nothing new to provision or store. This is an explicit improvement over the
+previous design: no third-party LLM API key is stored on any node any more,
+and `state/secrets.env` no longer exists.
+
+The feature is disabled by default.
 
 ## Uninstall
 

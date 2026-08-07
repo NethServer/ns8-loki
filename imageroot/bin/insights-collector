@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+#
+# Copyright (C) 2026 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+"""Collect one window of logs, deduplicate to templates, ship a bundle.
+
+This node does no analysis. It filters, masks, counts and sends; the server
+gates, infers and stores.
+"""
+
+import argparse
+import base64
+import datetime
+import json
+import os
+import ssl
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pypkg"))
+
+from insights import bundle as bundle_mod           # noqa: E402
+from insights import select                          # noqa: E402
+from insights.loki import Client, HOST_BUCKET, LokiError  # noqa: E402
+
+COLLECTOR_VERSION = "2.0.0"
+DEFAULT_MAX_LINES = 500
+WINDOW_MINUTES = 15
+BASELINE_HOURS = 168
+DEVIATION_TOLERANCE = 3.0
+
+# Structurally noisy but benign patterns, filtered at the Loki query so they
+# never travel. Ships empty: curating it needs real fleet data, not a guess.
+DENYLIST = []
+
+# Field names in the cluster/subscription Redis hash. Pending confirmation
+# against a live node; the secret fallback list exists only until then.
+SUBSCRIPTION_ID_FIELD = "system_id"
+SUBSCRIPTION_SECRET_FIELDS = ("auth_token", "secret", "password")
+
+
+def read_identity():
+    """(system_id, secret) from the cluster subscription, or (None, None).
+
+    Identity is not module configuration: it is the node's existing
+    NethServer subscription, so a configured collector cannot be pointed at
+    a different tenant by editing module state.
+    """
+    import agent  # deferred: unavailable in the unit-test container
+
+    raw = agent.redis_connect().hgetall("cluster/subscription")
+    fields = {}
+    for key, value in raw.items():
+        if isinstance(key, bytes):
+            key = key.decode()
+        if isinstance(value, bytes):
+            value = value.decode()
+        fields[key] = value
+
+    system_id = fields.get(SUBSCRIPTION_ID_FIELD) or None
+    secret = None
+    for name in SUBSCRIPTION_SECRET_FIELDS:
+        value = fields.get(name)
+        if value:
+            secret = value
+            break
+
+    if not system_id or not secret:
+        print("cluster/subscription is missing required fields; present: {0}".format(
+            sorted(fields.keys())), file=sys.stderr)
+        return None, None
+
+    return system_id, secret
+
+
+def compute_window(now, minutes=WINDOW_MINUTES):
+    end = now.replace(second=0, microsecond=0)
+    end -= datetime.timedelta(minutes=end.minute % minutes)
+    return end - datetime.timedelta(minutes=minutes), end
+
+
+def ms(when):
+    return int(when.timestamp() * 1000)
+
+
+def collect(client, window, max_lines, self_identifier, system_id):
+    start, end = window
+    modules = client.module_ids(start, end)
+
+    window_seconds = (end - start).total_seconds()
+    observed = client.digest(end, window_seconds)
+    baseline = client.digest(end, BASELINE_HOURS * 3600)
+    digest_available = bool(observed)
+
+    # Digest rows, and the set of modules that deviate from baseline.
+    digest_rows, deviating = [], set()
+    for (module_id, priority), count in sorted(observed.items()):
+        row = {"module_id": module_id, "priority": priority,
+               "observed": int(count)}
+        base = baseline.get((module_id, priority))
+        if base:
+            expected = base / BASELINE_HOURS * (window_seconds / 3600.0)
+            if expected > 0:
+                row["expected"] = round(expected, 3)
+                if count / expected > DEVIATION_TOLERANCE:
+                    deviating.add(module_id)
+        digest_rows.append(row)
+
+    shares = select.allocate(modules, max_lines, prioritised=deviating)
+
+    templates, truncated = [], []
+    lines_seen = lines_kept = 0
+    for module_id in modules:
+        share = shares.get(module_id, select.MIN_SHARE)
+        limit = select.fetch_limit(share)
+        try:
+            forward = client.lines(module_id, start, end, limit,
+                                   DENYLIST, self_identifier, "forward")
+        except LokiError as exc:
+            print("module {0}: {1}".format(module_id or "<host>", exc),
+                  file=sys.stderr)
+            continue
+
+        hit_cap = len(forward) >= limit
+        if hit_cap:
+            # Only now pay for a second page, so a late-developing incident
+            # is not hidden behind an early burst.
+            try:
+                backward = client.lines(module_id, start, end, limit // 2,
+                                        DENYLIST, self_identifier, "backward")
+            except LokiError:
+                backward = []
+            page = bundle_mod.sample_ends(forward, backward, limit)
+        else:
+            page = forward
+
+        module_templates, kept, fetched = bundle_mod.group_templates(
+            page, module_id, share)
+        templates.extend(module_templates)
+        lines_seen += fetched
+        lines_kept += kept
+
+        if hit_cap:
+            total = sum(int(c) for (m, _p), c in observed.items() if m == module_id)
+            truncated.append({
+                "module_id": module_id,
+                "dropped": max(0, total - fetched) if digest_available else 0,
+                # Without this flag a module that hit the cap during a digest
+                # outage reports dropped=0 and is indistinguishable from a
+                # healthy one -- read by the server as nominal.
+                "truncated": True,
+            })
+
+    budget = {"max_lines": max_lines, "lines_seen": lines_seen,
+              "lines_kept": lines_kept}
+    if truncated:
+        budget["truncated_modules"] = truncated
+
+    return bundle_mod.build(
+        system_id,
+        COLLECTOR_VERSION, (ms(start), ms(end)), digest_rows, templates, budget)
+
+
+def ship(payload, url, system_id, secret, verify=True, timeout=60):
+    body = json.dumps(payload).encode()
+    request = urllib.request.Request(url.rstrip("/") + "/v1/bundles", data=body)
+    request.add_header("Content-Type", "application/json")
+    token = base64.b64encode("{0}:{1}".format(system_id, secret).encode()).decode()
+    request.add_header("Authorization", "Basic " + token)
+    if verify:
+        ctx = ssl.create_default_context()
+    else:
+        # Self-signed test servers only; verification is on by default.
+        ctx = ssl._create_unverified_context()
+    with urllib.request.urlopen(request, timeout=timeout, context=ctx) as response:
+        return response.status, response.read().decode()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--max-lines", type=int, default=DEFAULT_MAX_LINES)
+    parser.add_argument("--minutes", type=int, default=WINDOW_MINUTES)
+    parser.add_argument("--print", dest="show", action="store_true",
+                        help="write the bundle to stdout instead of shipping")
+    args = parser.parse_args(argv)
+
+    try:
+        port = os.environ["LOKI_HTTP_PORT"]
+        client = Client("http://127.0.0.1:" + port,
+                        os.environ["LOKI_API_AUTH_USERNAME"],
+                        os.environ["LOKI_API_AUTH_PASSWORD"])
+    except KeyError as exc:
+        print("missing Loki variable {0}; run under runagent".format(exc),
+              file=sys.stderr)
+        return 1
+
+    module_id = os.environ.get("MODULE_ID", "loki1")
+    window = compute_window(datetime.datetime.now(datetime.timezone.utc),
+                            args.minutes)
+
+    if args.show:
+        try:
+            payload = collect(client, window, args.max_lines,
+                              "{0}/insights-collector".format(module_id),
+                              "unknown")
+        except LokiError as exc:
+            print("collection failed: {0}".format(exc), file=sys.stderr)
+            return 1
+        json.dump(payload, sys.stdout, indent=2)
+        print()
+        return 0
+
+    # Both cheap checks run before the Loki queries: an unconfigured node
+    # should cost nothing per fire, not a full collection it then discards.
+    url = os.environ.get("INSIGHTS_SERVER_URL")
+    if not url:
+        print("INSIGHTS_SERVER_URL is not set", file=sys.stderr)
+        return 1
+    verify = os.environ.get("INSIGHTS_VERIFY_TLS", "").strip().lower() not in (
+        "0", "false", "no", "off")
+
+    system_id, secret = read_identity()
+    if not system_id:
+        print("no subscription found; cannot ship bundles", file=sys.stderr)
+        return 1
+
+    try:
+        payload = collect(client, window, args.max_lines,
+                          "{0}/insights-collector".format(module_id),
+                          system_id)
+    except LokiError as exc:
+        print("collection failed: {0}".format(exc), file=sys.stderr)
+        return 1
+
+    try:
+        status, text = ship(payload, url, system_id, secret, verify=verify)
+    except urllib.error.HTTPError as exc:
+        print("ship failed {0}: {1}".format(exc.code,
+              exc.read().decode()[:300]), file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print("ship failed: {0}".format(exc.reason), file=sys.stderr)
+        return 1
+
+    print("shipped {0} templates, {1} lines -> {2} {3}".format(
+        len(payload["templates"]), payload["budget"]["lines_kept"], status, text.strip()))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,10 @@
+[Unit]
+Description=Nethesis insights collector
+Requires=loki-server.service
+After=loki-server.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=%E/state/environment
+ExecStart=runagent %E/bin/insights-collector
+SyslogIdentifier=%u/%N
