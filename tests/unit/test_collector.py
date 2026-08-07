@@ -305,6 +305,25 @@ class TestMainFailurePaths:
         monkeypatch.setattr(collector, "read_identity", lambda: (None, None))
         assert collector.main([]) == 1
 
+    def test_ship_timeout_fails_cleanly(self, collector, monkeypatch, capsys):
+        # urllib only wraps send-phase failures as URLError; a timeout while
+        # waiting for the response on an already-open connection surfaces as
+        # a bare TimeoutError, which main() must not let escape as a
+        # traceback.
+        self._set_loki_env(monkeypatch)
+        monkeypatch.setenv("INSIGHTS_SERVER_URL", "https://insights.example/")
+        monkeypatch.setattr(collector, "read_identity", lambda: ("sys1", "secret1"))
+        monkeypatch.setattr(collector, "collect",
+                            lambda *a, **k: {"templates": [], "budget": {"lines_kept": 0}})
+
+        def fake_ship(*a, **k):
+            raise TimeoutError("timed out")
+
+        monkeypatch.setattr(collector, "ship", fake_ship)
+
+        assert collector.main([]) == 1
+        assert "timed out" in capsys.readouterr().err
+
     def test_print_succeeds_with_neither_subscription_nor_server_url(
             self, collector, monkeypatch, capsys):
         # --print is the documented zero-cost inspection path: it must work

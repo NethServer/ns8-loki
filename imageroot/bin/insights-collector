@@ -244,6 +244,12 @@ def main(argv=None):
     except urllib.error.URLError as exc:
         print("ship failed: {0}".format(exc.reason), file=sys.stderr)
         return 1
+    except TimeoutError:
+        # A hang after the request is fully sent surfaces here, not as
+        # URLError: urllib only wraps send-phase failures, not response-read
+        # timeouts on an already-open connection.
+        print("ship failed: timed out waiting for a response", file=sys.stderr)
+        return 1
 
     print("shipped {0} templates, {1} lines -> {2} {3}".format(
         len(payload["templates"]), payload["budget"]["lines_kept"], status, text.strip()))
