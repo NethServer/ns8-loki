@@ -5,7 +5,11 @@ Suite Teardown    Tear down insights
 
 *** Variables ***
 ${MID}              loki1
-${STUB_PORT}        9100
+# 9100 is node_exporter's well-known default port and it already runs on
+# every NS8 test node, so the stub silently loses the bind and this suite's
+# health check ends up talking to node_exporter instead. Stay clear of the
+# whole Prometheus-ecosystem port neighborhood (9090-9100 and friends).
+${STUB_PORT}        19100
 ${STUB_URL}         http://127.0.0.1:${STUB_PORT}
 ${RECORD_FILE}      /tmp/insights-stub.jsonl
 
