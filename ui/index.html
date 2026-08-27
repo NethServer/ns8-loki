@@ -1,10 +1,41 @@
 <!DOCTYPE html>
 <html>
     <head>
-        <title>Loki admin UI</title>
+        <meta charset="utf-8">
+        <title>Redirect - Loki</title>
+        <style>
+            body {
+                background-color: #f4f4f4;
+                color: #161616;
+                font-family: sans-serif;
+            }
+            a {
+                color: #0090de;
+                text-decoration: none;
+            }
+        </style>
     </head>
     <body>
-        <h1>Loki admin UI</h1>
-        <p>This is a placeholder</p>
+        <h1>Automatic redirection</h1>
+        <p><a id="goto" href="#/settings/system-logs">Go to Settings &gt; System logs &#x2192;</a></p>
+        <script>
+            // This page is embedded as an IFRAME by the cluster UI: the hash
+            // must be changed on the top window, otherwise only the iframe
+            // location is updated and the Vue router never sees it.
+            function gotoSystemLogs() {
+                try {
+                    window.top.location.hash = "#/settings/system-logs";
+                } catch (e) {
+                    // Cross-origin top window: nothing we can do from here
+                }
+            }
+
+            document.getElementById("goto").addEventListener("click", function (ev) {
+                ev.preventDefault();
+                gotoSystemLogs();
+            });
+
+            setTimeout(gotoSystemLogs, 3000);
+        </script>
     </body>
 </html>
