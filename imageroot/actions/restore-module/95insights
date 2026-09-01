@@ -19,7 +19,7 @@ import sys
 if not os.getenv('INSIGHTS_SERVER_URL'):
     sys.exit(0)
 
-subprocess.run(["systemctl", "--user", "enable", "--now", "insights-collector.timer"],
+subprocess.run(["systemctl", "--user", "enable", "--now", "insights-collector.service"],
                stdout=sys.stderr,
                stderr=sys.stderr,
                text=True,

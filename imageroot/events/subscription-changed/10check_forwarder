@@ -22,13 +22,13 @@ if data['action'] == 'terminated':
                     stderr=sys.stderr,
                     check=True)
 
-    # A terminated subscription would otherwise leave a timer firing every 15
-    # minutes against an identity that no longer validates.
+    # A terminated subscription would otherwise leave the daemon running
+    # every 15 minutes against an identity that no longer validates.
     agent.munset_env(['INSIGHTS_SERVER_URL', 'INSIGHTS_VERIFY_TLS'])
 
-    # check=False: the timer may never have been enabled, and that must not
-    # fail the event handler.
-    subprocess.run(["systemctl", "--user", "disable", "--now", "insights-collector.timer"],
+    # check=False: the service may never have been enabled, and that must
+    # not fail the event handler.
+    subprocess.run(["systemctl", "--user", "disable", "--now", "insights-collector.service"],
                     stdout=sys.stderr,
                     stderr=sys.stderr,
                     check=False)

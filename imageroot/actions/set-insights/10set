@@ -25,23 +25,27 @@ if request['active']:
 
     agent.set_env('INSIGHTS_SERVER_URL', request['base_url'].rstrip('/'))
     agent.set_env('INSIGHTS_VERIFY_TLS', '1' if request.get('verify_tls', True) else '0')
-    action = 'enable'
+
+    # Unlike the old oneshot-per-fire timer, the collector is now a
+    # long-running daemon that reads its environment once at startup, so a
+    # reconfigure while already active needs an explicit restart to pick up
+    # the new base_url/verify_tls. `enable` (no --now) then `restart` covers
+    # both a first activation (restart on a stopped unit just starts it) and
+    # a live reconfigure in one call.
+    subprocess.run(["systemctl", "--user", "enable", "insights-collector.service"],
+                   stdout=sys.stderr,
+                   stderr=sys.stderr,
+                   text=True,
+                   check=True)
+    subprocess.run(["systemctl", "--user", "restart", "insights-collector.service"],
+                   stdout=sys.stderr,
+                   stderr=sys.stderr,
+                   text=True,
+                   check=True)
 else:
     agent.munset_env(['INSIGHTS_SERVER_URL', 'INSIGHTS_VERIFY_TLS'])
-    action = 'disable'
-
-# The unit files may be new to this installation
-subprocess.run(["systemctl", "--user", "daemon-reload"],
-               stdout=sys.stderr,
-               stderr=sys.stderr,
-               text=True,
-               check=True)
-
-# Enable or disable the timer, never the oneshot service. Re-running while
-# active only rewrites the environment: the oneshot reads its environment
-# at each fire, so the timer needs no restart.
-subprocess.run(["systemctl", "--user", action, "--now", "insights-collector.timer"],
-               stdout=sys.stderr,
-               stderr=sys.stderr,
-               text=True,
-               check=True)
+    subprocess.run(["systemctl", "--user", "disable", "--now", "insights-collector.service"],
+                   stdout=sys.stderr,
+                   stderr=sys.stderr,
+                   text=True,
+                   check=True)

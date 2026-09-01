@@ -113,7 +113,7 @@
                         "failed",
                         "inactive"
                     ],
-                    "description": "State of insights-collector.timer."
+                    "description": "State of insights-collector.service."
                 },
                 "base_url": {
                     "type": "string",
@@ -129,7 +129,7 @@
                 },
                 "last_run": {
                     "type": "string",
-                    "description": "ExecMainExitTimestamp of insights-collector.service, empty if never run."
+                    "description": "Timestamp of the last successful bundle ship, empty if never run."
                 }
             }
         }

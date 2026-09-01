@@ -7,30 +7,33 @@
 
 This node does no analysis. It filters, masks, counts and sends; the server
 gates, infers and stores.
+
+Single file on purpose: this is the whole collector, so copying this one
+file is enough to deploy or test it manually, no sibling package needed.
 """
 
 import argparse
 import base64
+import collections
 import datetime
 import json
 import os
+import random
+import re
+import signal
 import ssl
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pypkg"))
-
-from insights import bundle as bundle_mod           # noqa: E402
-from insights import select                          # noqa: E402
-from insights.loki import Client, HOST_BUCKET, LokiError  # noqa: E402
 
 COLLECTOR_VERSION = "2.0.0"
 DEFAULT_MAX_LINES = 500
 WINDOW_MINUTES = 15
 BASELINE_HOURS = 168
 DEVIATION_TOLERANCE = 3.0
+LAST_RUN_FILE = "insights_last_run"
 
 # Structurally noisy but benign patterns, filtered at the Loki query so they
 # never travel. Ships empty: curating it needs real fleet data, not a guess.
@@ -41,6 +44,483 @@ DENYLIST = []
 SUBSCRIPTION_ID_FIELD = "system_id"
 SUBSCRIPTION_SECRET_FIELDS = ("auth_token", "secret", "password")
 
+
+# --------------------------------------------------------------------------
+# Secret removal.
+#
+# Distinct from masking below: this removes secrets and deliberately
+# PRESERVES IP addresses, hostnames and module IDs because they carry
+# signal. mask() then replaces those for grouping. Both outputs are kept
+# downstream.
+# --------------------------------------------------------------------------
+
+# Ordered: keyword assignments (Bearer's space-separated value first, then
+# other secret keywords requiring an explicit assignment character), then
+# Authorization headers, then email addresses, then long opaque blobs. Email
+# runs before the blob rule so a long local part is still reported as an
+# email. Both keyword rules allow optional whitespace around the separator
+# (aligned/structured logs commonly pad it, e.g. "key : value") without
+# reopening the bare-whitespace false positive: the character class still
+# requires an actual "=", ":" or quote, which plain prose never supplies.
+SCRUB_RULES = [
+    (
+        re.compile(r'(?i)\b(bearer)\b\s*[=:\s"\']+\s*\S+'),
+        r'\1=<redacted>',
+    ),
+    (
+        re.compile(r'(?i)\b(tokens?|api[-_]?keys?|secrets?|passwords?|passwd|pwd)\b\s*[=:"\']+\s*\S+'),
+        r'\1=<redacted>',
+    ),
+    (
+        re.compile(r'(?i)\bauthorization:\s*\S+(?:\s+\S+)?'),
+        'authorization: <redacted>',
+    ),
+    # The negative lookahead keeps systemd templated unit names intact.
+    # `agent@nethvoice2.service` is not an address, and those PRIORITY=3 lines
+    # are how a crash loop names the module that is failing.
+    (
+        re.compile(
+            r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*'
+            r'\.(?!service\b|timer\b|socket\b|target\b|slice\b|scope\b|mount\b'
+            r'|path\b|device\b|swap\b|automount\b)[A-Za-z]{2,}\b'
+        ),
+        '<redacted-email>',
+    ),
+    # `/` is deliberately excluded: a long filesystem path or URL is signal,
+    # not an opaque blob, and the base64 alphabet would otherwise swallow it.
+    (
+        re.compile(r'\b[A-Za-z0-9+]{32,}={0,2}\b'),
+        '<redacted-blob>',
+    ),
+]
+
+
+WHITESPACE_RUN = re.compile(r'\s+')
+
+
+def scrub(line):
+    """Remove likely secrets from a log line.
+
+    Defence in depth, not a guarantee. IP addresses, hostnames, module IDs
+    and usernames are deliberately preserved: they carry the signal.
+    """
+    for pattern, replacement in SCRUB_RULES:
+        line = pattern.sub(replacement, line)
+    return line
+
+
+def sanitize_line(raw):
+    """Flatten a collected log line to exactly one prompt line, then scrub.
+
+    Journal messages can contain newlines. Left alone they would break the
+    one-record-per-line structure of the prompt's LINES block, letting a log
+    message forge additional lines or close the fence.
+    """
+    return scrub(WHITESPACE_RUN.sub(' ', raw).strip())
+
+
+# --------------------------------------------------------------------------
+# Masking: normalise volatile tokens so repeats collapse to one template.
+#
+# This runs *after* scrub() and does a different job. scrub() removes
+# secrets and deliberately preserves IP addresses, hostnames and module IDs
+# because they carry signal. Masking replaces exactly those volatile parts,
+# because two lines that differ only by a PID or an address are the same
+# event and must group together.
+#
+# Both outputs are kept downstream: the template (masked) is what gets
+# counted and hashed into a finding's identity, while the retained sample
+# line is the scrubbed-but-unmasked original, so an operator can still see
+# which address was actually refused.
+#
+# Rule order is load-bearing and is documented per rule below.
+# --------------------------------------------------------------------------
+
+# Bumped by hand whenever MASKING_RULES changes. A change alters every
+# template's text, so it invalidates every server-side template and
+# fingerprint at once. Travelling in the bundle makes the resulting one-time
+# duplicate burst explainable instead of mysterious.
+MASKING_VERSION = 1
+
+# Placeholders already present in the input are left alone, which is what
+# makes mask() idempotent. Listed here so one rule can protect all of them.
+_PLACEHOLDER = r'<(?:TS|PID|UUID|IP|PORT|HEX|NUM|PATH|USER|redacted[a-z-]*)>'
+
+MASKING_RULES = [
+    # 1. Volatile paths. Before any number rule, or /proc/12345 loses its
+    #    shape and stops matching as a path at all.
+    (
+        re.compile(r'(?:/tmp|/run|/var/tmp)/\S+'),
+        '<PATH>',
+    ),
+    (
+        re.compile(r'/proc/\d+(?:/\S*)?'),
+        '<PATH>',
+    ),
+    # 2. ISO-8601 timestamps. Before clock times, which are a prefix of them.
+    (
+        re.compile(
+            r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}'
+            r'(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?'
+        ),
+        '<TS>',
+    ),
+    # 3. Bare clock times. Before the port rule, which would otherwise claim
+    #    the ":32" tail, and before IPv6, which also uses colons.
+    (
+        re.compile(r'\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b'),
+        '<TS>',
+    ),
+    # 4. UUIDs. Must precede the hex rule, which would otherwise shred a UUID
+    #    into <HEX>-<HEX>-... and produce a template that never groups.
+    (
+        re.compile(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}'
+                   r'-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'),
+        '<UUID>',
+    ),
+    # 5. IPv6. Must precede the hex rule for the same reason as UUIDs, and
+    #    precede IPv4 so an IPv4-mapped form is taken whole. The compressed
+    #    "::" form may be followed by several more groups, so the tail is a
+    #    repeating group rather than a single optional one.
+    (
+        re.compile(r'(?<![\w:.])(?:'
+                   r'(?:[0-9a-fA-F]{1,4}:){1,7}:'
+                   r'(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?'
+                   r'|(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}'
+                   r'|::(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?'
+                   r')(?![\w:.])'),
+        '<IP>',
+    ),
+    # 6. IPv4, with an optional port taken in the same match.
+    #
+    #    The port cannot be a separate rule with a (?<=<IP>) lookbehind: by
+    #    the time that rule ran, <IP> would be a protected placeholder and
+    #    excluded from the text the rule is applied to, so the lookbehind
+    #    could never match. Consuming the port here also keeps the port from
+    #    reaching the bare-number rule.
+    (
+        re.compile(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?::(\d{1,5}))?(?![\w.])'),
+        lambda m: '<IP>:<PORT>' if m.group(1) else '<IP>',
+    ),
+    # 7. PIDs in their three common shapes. Before the bare-number rule.
+    (
+        re.compile(r'\[\d+\]'),
+        '[<PID>]',
+    ),
+    (
+        re.compile(r'(?i)\b(pid)\b([=: ]+)\d+'),
+        r'\1\2<PID>',
+    ),
+    (
+        re.compile(r'\((\d{2,})\)'),
+        '(<PID>)',
+    ),
+    # 9. Hex runs. After UUID and IPv6. Eight is the shortest run that is
+    #    more often a checksum than a word: "cafe" and "deadbeef" both exist
+    #    in prose, but eight-plus hex characters rarely do.
+    (
+        re.compile(r'\b(?=[0-9a-fA-F]*\d)[0-9a-fA-F]{8,}\b'),
+        '<HEX>',
+    ),
+    # 10. Account names in authentication messages.
+    #
+    #     Measured against six hours of real cluster logs: an SSH dictionary
+    #     attack produced 319 distinct templates that differed only by the
+    #     account being tried. Left unmasked, every window of an ongoing
+    #     attack looks like hundreds of brand-new templates, which opens the
+    #     server's novelty gate forever and defeats the cost control it
+    #     exists to provide. The retained sample line still carries the
+    #     actual account name, and the count carries the volume.
+    (
+        re.compile(r'(?i)\b(user)\s+(?!<)[^\s]+'),
+        r'\1 <USER>',
+    ),
+    # 11. Bare integers, last of all: every rule above embeds digits, and
+    #     running this earlier would dismantle them. Two digits minimum, so
+    #     priority markers like <3> and names like traefik1 survive.
+    (
+        re.compile(r'(?<![\w<])\d{2,}(?![\w>])'),
+        '<NUM>',
+    ),
+]
+
+# One pass that alternates "an existing placeholder" against "the next rule".
+# Matching placeholders first and re-emitting them unchanged is what stops a
+# second mask() call from rewriting <PID> into <[<PID>]> or <NUM> into <<NUM>>.
+_PROTECTED = re.compile(_PLACEHOLDER)
+
+
+def mask(line):
+    """Return the template form of one already-scrubbed log line."""
+    for pattern, replacement in MASKING_RULES:
+        line = _mask_apply(pattern, replacement, line)
+    return line
+
+
+def _mask_apply(pattern, replacement, line):
+    """Apply one rule to the parts of `line` that are not already placeholders."""
+    out = []
+    position = 0
+    for protected in _PROTECTED.finditer(line):
+        out.append(pattern.sub(replacement, line[position:protected.start()]))
+        out.append(protected.group(0))
+        position = protected.end()
+    out.append(pattern.sub(replacement, line[position:]))
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------
+# Line-budget allocation: divide the line budget between modules, fairly.
+# --------------------------------------------------------------------------
+
+# Every module is guaranteed this many lines before any weighting applies.
+# This is what actually fixes starvation: a crash-looping module can no
+# longer consume the whole budget, because every other module's floor is
+# reserved first.
+MIN_SHARE = 20
+
+# Deviating or security-carrying modules get this much of the remainder
+# relative to a quiet one.
+PRIORITY_WEIGHT = 3.0
+
+# Lines are fetched at OVERFETCH times a module's share, then deduplicated
+# down to that share's worth of distinct templates. Without this, "dedup
+# before capping" is impossible: Loki applies the cap at query time, before
+# the collector sees a line, so one repeated line would still consume the
+# whole allocation.
+OVERFETCH = 4
+OVERFETCH_CEILING = 2000
+
+
+def allocate(module_ids, max_lines, prioritised=()):
+    """Return {module_id: share}. The total never exceeds max_lines."""
+    modules = list(module_ids)
+    if not modules:
+        return {}
+
+    count = len(modules)
+    if count * MIN_SHARE >= max_lines:
+        # More modules than floor space. Equal shares, floor unreachable.
+        share = max(1, max_lines // count)
+        return {m: share for m in modules}
+
+    prioritised = set(prioritised)
+    weights = {m: (PRIORITY_WEIGHT if m in prioritised else 1.0) for m in modules}
+    total_weight = sum(weights.values())
+    remainder = max_lines - count * MIN_SHARE
+
+    return {m: MIN_SHARE + int(remainder * weights[m] / total_weight)
+            for m in modules}
+
+
+def fetch_limit(share):
+    """How many raw lines to pull so dedup has something to work with."""
+    return min(OVERFETCH_CEILING, max(share, share * OVERFETCH))
+
+
+# --------------------------------------------------------------------------
+# Loki HTTP client.
+#
+# Everything goes over the HTTP API. logcli is deliberately not used: the
+# two-pass design issues one query per module per run, and a subprocess
+# spawn per module is both slower and harder to diagnose than a status code.
+# --------------------------------------------------------------------------
+
+LOKI_TIMEOUT = 60
+
+# Host-level journal records (sshd, systemd, runagent) carry no module_id
+# label at all, so the label-values endpoint never lists them. They are
+# collected under this synthetic bucket instead. Measured on a live cluster,
+# these lines are the majority of security-relevant traffic, so dropping them
+# would defeat the point of the collector.
+HOST_BUCKET = ""
+
+
+class LokiError(RuntimeError):
+    pass
+
+
+class Client:
+    def __init__(self, base_url, username, password, timeout=LOKI_TIMEOUT):
+        self._base = base_url.rstrip("/")
+        self._auth = base64.b64encode(
+            "{0}:{1}".format(username, password).encode()).decode()
+        self._timeout = timeout
+
+    def _get(self, path, params):
+        url = "{0}{1}?{2}".format(self._base, path, urllib.parse.urlencode(params))
+        request = urllib.request.Request(url)
+        request.add_header("Authorization", "Basic " + self._auth)
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")[:500]
+            raise LokiError("{0} {1}: {2}".format(path, exc.code, body)) from exc
+        except urllib.error.URLError as exc:
+            raise LokiError("{0}: {1}".format(path, exc.reason)) from exc
+
+    @staticmethod
+    def _ns(when):
+        return str(int(when.timestamp() * 1e9))
+
+    def module_ids(self, start, end):
+        """Module IDs present in the window, plus the host bucket.
+
+        The label endpoint reads the index rather than series data, so unlike
+        a metric query it is not subject to max_query_series.
+        """
+        payload = self._get("/loki/api/v1/label/module_id/values",
+                            {"start": self._ns(start), "end": self._ns(end)})
+        return sorted(payload.get("data") or []) + [HOST_BUCKET]
+
+    def digest(self, at, range_seconds):
+        """{(module_id, priority): count} over the range ending at `at`.
+
+        Returns {} on failure. A busy cluster can exceed max_query_series on
+        this aggregation, and losing the digest costs prioritisation and the
+        `expected` field, not the run.
+        """
+        query = ('sum by (module_id, priority) '
+                 '(count_over_time({{node_id=~".+"}} | json priority="PRIORITY" [{0}s]))'
+                 ).format(int(range_seconds))
+        try:
+            payload = self._get("/loki/api/v1/query",
+                                {"query": query, "time": at.isoformat()})
+        except LokiError:
+            return {}
+        out = {}
+        for series in (payload.get("data") or {}).get("result") or []:
+            labels = series.get("metric") or {}
+            try:
+                priority = int(labels.get("priority", -1))
+                value = float(series["value"][1])
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+            out[(labels.get("module_id", HOST_BUCKET), priority)] = value
+        return out
+
+    def lines(self, module_id, start, end, limit, denylist, self_identifier,
+              direction="forward"):
+        """Prefiltered lines for one module. Returns a list of (ts_ms, text)."""
+        selector = ('{{module_id="{0}", node_id=~".+"}}'.format(module_id)
+                    if module_id else '{node_id=~".+", module_id=""}')
+        stages = [
+            selector,
+            '| json priority="PRIORITY", identifier="SYSLOG_IDENTIFIER", message="MESSAGE"',
+            '| identifier != "{0}"'.format(self_identifier),
+            '| priority < 5 or category="security"',
+        ]
+        if denylist:
+            stages.append('!~ "{0}"'.format("|".join(denylist)))
+        stages.append(
+            '| line_format "<{{.priority}}> [{{.identifier}}] {{.message}}"')
+        payload = self._get("/loki/api/v1/query_range", {
+            "query": " ".join(stages),
+            "start": self._ns(start), "end": self._ns(end),
+            "limit": str(int(limit)), "direction": direction,
+        })
+        # category is a stream label, not a line field, so it is read per
+        # series rather than parsed back out of the rendered line. Losing it
+        # would make the server's security gate condition unreachable.
+        out = []
+        for series in (payload.get("data") or {}).get("result") or []:
+            category = (series.get("stream") or {}).get("category", "")
+            for ns, text in series.get("values") or []:
+                out.append((int(ns) // 1000000, text, category))
+        out.sort()
+        return out
+
+
+# --------------------------------------------------------------------------
+# Bundle assembly: turn collected lines into the wire payload.
+# --------------------------------------------------------------------------
+
+SCHEMA_VERSION = 1
+
+# The identifier is carried in the rendered line; the priority prefix is
+# parsed back out so templates can be grouped by it.
+PRIORITY_RE = re.compile(r'^<(\d+)>')
+
+
+def group_templates(lines, module_id, share):
+    """Deduplicate raw lines into counted templates.
+
+    `lines` is [(ts_ms, text, category)]. Returns (templates, kept, fetched).
+    Templates are emitted most-frequent-first and truncated to `share`, so a
+    module's budget buys distinct events rather than repetitions of one.
+    """
+    groups = collections.OrderedDict()
+    for ts, raw, category in lines:
+        clean = sanitize_line(raw)
+        template = mask(clean)
+        match = PRIORITY_RE.match(clean)
+        priority = int(match.group(1)) if match else 6
+        key = (template, priority, category)
+        entry = groups.get(key)
+        if entry is None:
+            groups[key] = {
+                "template": template, "count": 1,
+                "module_id": module_id, "priority": priority,
+                "category": category,
+                "first_seen": ts, "last_seen": ts,
+                "samples": [clean],
+            }
+        else:
+            entry["count"] += 1
+            entry["first_seen"] = min(entry["first_seen"], ts)
+            entry["last_seen"] = max(entry["last_seen"], ts)
+            # Keep the first and last raw line only; the server caps at 2.
+            if len(entry["samples"]) == 1:
+                entry["samples"].append(clean)
+            else:
+                entry["samples"][1] = clean
+
+    ordered = sorted(groups.values(), key=lambda t: (-t["count"], t["template"]))
+    kept = ordered[:share]
+    for entry in kept:
+        if not entry.get("category"):
+            entry.pop("category", None)
+    return kept, sum(t["count"] for t in kept), len(lines)
+
+
+def sample_ends(forward, backward, limit):
+    """Merge a forward and a backward page, keeping both ends of the window.
+
+    A pure first-N page lets an early burst hide a late-developing incident.
+    """
+    seen = set()
+    merged = []
+    for row in list(forward) + list(backward):
+        key = (row[0], row[1])
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+    merged.sort()
+    if len(merged) <= limit:
+        return merged
+    half = limit // 2
+    return merged[:half] + merged[-(limit - half):]
+
+
+def build_bundle(system_id, collector_version, window, digest_rows, templates, budget):
+    """Assemble the wire payload."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "system_id": system_id,
+        "collector_version": collector_version,
+        "masking_version": MASKING_VERSION,
+        "window": {"start": window[0], "end": window[1]},
+        "digest": digest_rows,
+        "templates": templates,
+        "budget": budget,
+    }
+
+
+# --------------------------------------------------------------------------
+# The collector itself.
+# --------------------------------------------------------------------------
 
 def read_identity():
     """(system_id, secret) from the cluster subscription, or (None, None).
@@ -109,13 +589,13 @@ def collect(client, window, max_lines, self_identifier, system_id):
                     deviating.add(module_id)
         digest_rows.append(row)
 
-    shares = select.allocate(modules, max_lines, prioritised=deviating)
+    shares = allocate(modules, max_lines, prioritised=deviating)
 
     templates, truncated = [], []
     lines_seen = lines_kept = 0
     for module_id in modules:
-        share = shares.get(module_id, select.MIN_SHARE)
-        limit = select.fetch_limit(share)
+        share = shares.get(module_id, MIN_SHARE)
+        limit = fetch_limit(share)
         try:
             forward = client.lines(module_id, start, end, limit,
                                    DENYLIST, self_identifier, "forward")
@@ -133,11 +613,11 @@ def collect(client, window, max_lines, self_identifier, system_id):
                                         DENYLIST, self_identifier, "backward")
             except LokiError:
                 backward = []
-            page = bundle_mod.sample_ends(forward, backward, limit)
+            page = sample_ends(forward, backward, limit)
         else:
             page = forward
 
-        module_templates, kept, fetched = bundle_mod.group_templates(
+        module_templates, kept, fetched = group_templates(
             page, module_id, share)
         templates.extend(module_templates)
         lines_seen += fetched
@@ -159,7 +639,7 @@ def collect(client, window, max_lines, self_identifier, system_id):
     if truncated:
         budget["truncated_modules"] = truncated
 
-    return bundle_mod.build(
+    return build_bundle(
         system_id,
         COLLECTOR_VERSION, (ms(start), ms(end)), digest_rows, templates, budget)
 
@@ -179,13 +659,118 @@ def ship(payload, url, system_id, secret, verify=True, timeout=60):
         return response.status, response.read().decode()
 
 
+def mark_last_run():
+    """Record a successful ship for get-configuration to read back.
+
+    The daemon never exits between windows, so there is no
+    ExecMainExitTimestamp for get-configuration to read any more; it reads
+    this file instead, same pattern as the existing
+    cloud_log_manager_last_timestamp / syslog_last_timestamp files.
+    """
+    try:
+        with open(LAST_RUN_FILE, "w") as last_run_file:
+            last_run_file.write(
+                datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))
+    except OSError as exc:
+        print("could not write {0}: {1}".format(LAST_RUN_FILE, exc), file=sys.stderr)
+
+
+def collect_and_ship(client, window, max_lines, module_id, url, verify):
+    """Run one window end-to-end. Returns True if the bundle shipped."""
+    system_id, secret = read_identity()
+    if not system_id:
+        print("no subscription found; cannot ship bundles", file=sys.stderr)
+        return False
+
+    try:
+        payload = collect(client, window, max_lines,
+                          "{0}/insights-collector".format(module_id),
+                          system_id)
+    except LokiError as exc:
+        print("collection failed: {0}".format(exc), file=sys.stderr)
+        return False
+
+    try:
+        status, text = ship(payload, url, system_id, secret, verify=verify)
+    except urllib.error.HTTPError as exc:
+        print("ship failed {0}: {1}".format(exc.code,
+              exc.read().decode()[:300]), file=sys.stderr)
+        return False
+    except urllib.error.URLError as exc:
+        print("ship failed: {0}".format(exc.reason), file=sys.stderr)
+        return False
+    except TimeoutError:
+        # A hang after the request is fully sent surfaces here, not as
+        # URLError: urllib only wraps send-phase failures, not response-read
+        # timeouts on an already-open connection.
+        print("ship failed: timed out waiting for a response", file=sys.stderr)
+        return False
+
+    print("shipped {0} templates, {1} lines -> {2} {3}".format(
+        len(payload["templates"]), payload["budget"]["lines_kept"], status, text.strip()))
+    mark_last_run()
+    return True
+
+
+def _sleep_interruptible(seconds, stop):
+    # Plain time.sleep() resumes after a signal (PEP 475), so a lone SIGTERM
+    # flag flip would not actually cut a 15-minute sleep short. Poll in small
+    # slices instead so shutdown reacts within a few seconds.
+    deadline = time.monotonic() + seconds
+    while not stop["flag"]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 5.0))
+
+
+def run_daemon(client, minutes, max_lines, module_id, url, verify):
+    """Loop forever: one window, then sleep to the next boundary.
+
+    Each iteration only holds local state (built fresh inside collect() /
+    collect_and_ship()), so nothing accumulates across iterations -- the
+    process's memory footprint should stay flat run over run.
+    """
+    stop = {"flag": False}
+
+    def handle_stop(signum, frame):
+        stop["flag"] = True
+
+    signal.signal(signal.SIGTERM, handle_stop)
+    signal.signal(signal.SIGINT, handle_stop)
+
+    while not stop["flag"]:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        window = compute_window(now, minutes)
+        collect_and_ship(client, window, max_lines, module_id, url, verify)
+        if stop["flag"]:
+            break
+
+        # Mirrors the old timer's RandomizedDelaySec: a bit of slack past
+        # the boundary so the just-closed window's logs have settled, spread
+        # out so a fleet that started together doesn't all fire in lockstep.
+        _, end = window
+        next_boundary = end + datetime.timedelta(minutes=minutes)
+        jitter = random.uniform(0, 120)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        sleep_for = max(1.0, (next_boundary - now).total_seconds() + jitter)
+        _sleep_interruptible(sleep_for, stop)
+
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--max-lines", type=int, default=DEFAULT_MAX_LINES)
     parser.add_argument("--minutes", type=int, default=WINDOW_MINUTES)
     parser.add_argument("--print", dest="show", action="store_true",
                         help="write the bundle to stdout instead of shipping")
+    parser.add_argument("--daemon", action="store_true",
+                        help="loop forever, shipping one window every "
+                             "--minutes instead of exiting after one")
     args = parser.parse_args(argv)
+    if args.show and args.daemon:
+        parser.error("--print and --daemon are mutually exclusive")
 
     try:
         port = os.environ["LOKI_HTTP_PORT"]
@@ -198,10 +783,10 @@ def main(argv=None):
         return 1
 
     module_id = os.environ.get("MODULE_ID", "loki1")
-    window = compute_window(datetime.datetime.now(datetime.timezone.utc),
-                            args.minutes)
 
     if args.show:
+        window = compute_window(datetime.datetime.now(datetime.timezone.utc),
+                                args.minutes)
         try:
             payload = collect(client, window, args.max_lines,
                               "{0}/insights-collector".format(module_id),
@@ -222,38 +807,14 @@ def main(argv=None):
     verify = os.environ.get("INSIGHTS_VERIFY_TLS", "").strip().lower() not in (
         "0", "false", "no", "off")
 
-    system_id, secret = read_identity()
-    if not system_id:
-        print("no subscription found; cannot ship bundles", file=sys.stderr)
-        return 1
+    if args.daemon:
+        return run_daemon(client, args.minutes, args.max_lines, module_id,
+                          url, verify)
 
-    try:
-        payload = collect(client, window, args.max_lines,
-                          "{0}/insights-collector".format(module_id),
-                          system_id)
-    except LokiError as exc:
-        print("collection failed: {0}".format(exc), file=sys.stderr)
-        return 1
-
-    try:
-        status, text = ship(payload, url, system_id, secret, verify=verify)
-    except urllib.error.HTTPError as exc:
-        print("ship failed {0}: {1}".format(exc.code,
-              exc.read().decode()[:300]), file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print("ship failed: {0}".format(exc.reason), file=sys.stderr)
-        return 1
-    except TimeoutError:
-        # A hang after the request is fully sent surfaces here, not as
-        # URLError: urllib only wraps send-phase failures, not response-read
-        # timeouts on an already-open connection.
-        print("ship failed: timed out waiting for a response", file=sys.stderr)
-        return 1
-
-    print("shipped {0} templates, {1} lines -> {2} {3}".format(
-        len(payload["templates"]), payload["budget"]["lines_kept"], status, text.strip()))
-    return 0
+    window = compute_window(datetime.datetime.now(datetime.timezone.utc),
+                            args.minutes)
+    return 0 if collect_and_ship(client, window, args.max_lines, module_id,
+                                 url, verify) else 1
 
 
 if __name__ == "__main__":

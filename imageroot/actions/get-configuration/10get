@@ -69,7 +69,7 @@ except:
 
 insights = {}
 
-insights_status = subprocess.run(['systemctl', '--user', 'is-active', 'insights-collector.timer'], capture_output=True, text=True)
+insights_status = subprocess.run(['systemctl', '--user', 'is-active', 'insights-collector.service'], capture_output=True, text=True)
 match insights_status.stdout.strip():
     case 'active':
         insights["status"] = 'active'
@@ -86,8 +86,14 @@ insights["verify_tls"] = os.getenv('INSIGHTS_VERIFY_TLS', '1') != '0'
 # module secret of its own.
 insights["subscription_configured"] = bool(rdb.hgetall('cluster/subscription'))
 
-insights_last_run = subprocess.run(['systemctl', '--user', 'show', 'insights-collector.service', '-p', 'ExecMainExitTimestamp', '--value'], capture_output=True, text=True)
-insights["last_run"] = insights_last_run.stdout.strip()
+# The collector is a long-running daemon now, not a oneshot fired by a
+# timer, so there is no ExecMainExitTimestamp per window any more: it
+# writes its own last-successful-ship timestamp instead.
+try:
+    with open("./insights_last_run", "r") as insights_file:
+        insights["last_run"] = insights_file.read()
+except OSError:
+    insights["last_run"] = ""
 
 # General
 

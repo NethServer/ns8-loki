@@ -100,7 +100,7 @@ Note: `active_to` field WILL miss if the instance is still active.
 
 ### `set-insights`
 
-Configure the insights collector. On its 15-minute timer it collects a window
+Configure the insights collector. Every 15 minutes it collects a window
 of the cluster journal, scrubs likely secrets, masks variable text,
 deduplicates the result into counted templates, and ships the bundle to the
 Nethesis insights service, where the actual (LLM-based) analysis happens.
@@ -109,9 +109,12 @@ default.
 
 #### Parameters
 
-- `active`: enable or disable `insights-collector.timer`. Required.
+- `active`: enable or disable the `insights-collector` daemon. Required.
 - `base_url`: base URL of the insights server. Required when `active` is
-  `true`.
+  `true`. Some deployments path-mount the server (e.g.
+  `https://host/insights`) rather than serving it at the bare host, in which
+  case that path segment is part of `base_url`; check with
+  `curl <base_url>/healthz`, which should return `200`.
 - `verify_tls`: verify the server TLS certificate. Optional, default `true`.
   Set to `false` only for a self-signed test server — never against a
   production endpoint.
@@ -171,9 +174,11 @@ runagent -m loki1 ../bin/insights-collector --print
 | `--print` | build the bundle and write it to stdout instead of shipping; needs no subscription and no server URL |
 | `--max-lines N` | cap on log lines read per window, before deduplication. Default `500` |
 | `--minutes N` | window size in minutes. Default `15` |
+| `--daemon` | loop forever, shipping one window every `--minutes` instead of exiting after one; this is how `systemctl --user start insights-collector.service` runs it |
 
-A run covers one window and exits. A failure is loud and costs exactly one
-window: the next timer fire retries.
+Without `--daemon`, a run covers one window and exits — useful for manual
+testing. As a long-running daemon, a failed window is logged and the loop
+continues to the next one rather than exiting.
 
 #### Sizing
 
@@ -189,12 +194,12 @@ counts. A template still carries the fixed text of the log messages it stands
 for — that text is the signal — but the variable parts are replaced and
 identical events collapse into one counted entry, so no line is sent verbatim.
 Two passes run before anything is sent:
-`imageroot/pypkg/insights/scrub.py` removes likely secrets
-(`password=`, `token=`, `api_key=`, `Authorization` headers, long base64
-runs, email addresses), and `imageroot/pypkg/insights/masking.py` replaces
-variable text (timestamps, PIDs, addresses, UUIDs and similar) so that
-repeated events collapse to one template. This is defence in depth, not a
-guarantee.
+the `scrub()` function in `imageroot/bin/insights-collector`
+removes likely secrets (`password=`, `token=`, `api_key=`, `Authorization`
+headers, long base64 runs, email addresses), and `mask()` in the same file
+replaces variable text (timestamps, PIDs, addresses, UUIDs and similar) so
+that repeated events collapse to one template. This is defence in depth,
+not a guarantee.
 
 The destination is the Nethesis insights service, authenticated with the
 subscription identity (`system_id` and secret) the node already holds —

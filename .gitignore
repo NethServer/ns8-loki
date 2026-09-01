@@ -1,9 +1,0 @@
-
-# local scratch: OpenRouter credentials, not for commit
-open_router
-test.sh
-
-__pycache__/
-*.pyc
-
-tests/outputs/

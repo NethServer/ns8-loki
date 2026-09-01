@@ -81,7 +81,7 @@ Configure insights against the stub
     Run module action    set-insights
     ...    {"active":true,"base_url":"${STUB_URL}","verify_tls":false}
     ${output}    ${rc} =    Execute Command
-    ...    runagent -m ${MID} systemctl --user is-active insights-collector.timer
+    ...    runagent -m ${MID} systemctl --user is-active insights-collector.service
     ...    return_rc=${True}
     Should Be Equal As Strings    ${output}    active
 
@@ -91,11 +91,14 @@ get-configuration reports the active collector and its stub target
     ...    "status": "active", "base_url": "${STUB_URL}", "verify_tls": false
     Should Contain    ${output}    "subscription_configured"
 
-The oneshot service ships a bundle authenticated with the subscription
+A single run ships a bundle authenticated with the subscription
+    # The daemon (already running from the configure step above) may or may
+    # not have fired its first window yet, so invoke a deterministic single
+    # run directly rather than racing it.
     ${output}    ${rc} =    Execute Command
-    ...    runagent -m ${MID} systemctl --user start insights-collector.service
+    ...    runagent -m ${MID} ../bin/insights-collector
     ...    return_rc=${True}
-    Should Be Equal As Integers    ${rc}    0    service failed to run: ${output}
+    Should Be Equal As Integers    ${rc}    0    single run failed: ${output}
     Wait Until Keyword Succeeds    60s    5s    The stub recorded a bundle from the collector
 
 --print emits a bundle without shipping or authenticating
@@ -107,12 +110,12 @@ The oneshot service ships a bundle authenticated with the subscription
     Should Contain    ${output}    templates
     Should Contain    ${output}    budget
 
-Disabling insights stops the timer and clears the module environment
+Disabling insights stops the daemon and clears the module environment
     Run module action    set-insights    {"active":false}
-    ${timer}    ${rc} =    Execute Command
-    ...    runagent -m ${MID} systemctl --user is-active insights-collector.timer
+    ${service}    ${rc} =    Execute Command
+    ...    runagent -m ${MID} systemctl --user is-active insights-collector.service
     ...    return_rc=${True}
-    Should Not Be Equal As Strings    ${timer}    active
+    Should Not Be Equal As Strings    ${service}    active
     # Read the environment back through the module's own API rather than
     # redis-cli, which needs credentials this suite does not carry.
     ${output} =    Run module action    get-configuration
