@@ -359,6 +359,11 @@ class Client:
             raise LokiError("{0} {1}: {2}".format(path, exc.code, body)) from exc
         except urllib.error.URLError as exc:
             raise LokiError("{0}: {1}".format(path, exc.reason)) from exc
+        except TimeoutError as exc:
+            # A hang after the request is fully sent surfaces here, not as
+            # URLError: urllib only wraps send-phase failures, not
+            # response-read timeouts on an already-open connection.
+            raise LokiError("{0}: timed out waiting for a response".format(path)) from exc
 
     @staticmethod
     def _ns(when):
