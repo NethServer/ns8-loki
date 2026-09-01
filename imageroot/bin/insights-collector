@@ -22,6 +22,7 @@ import random
 import re
 import signal
 import ssl
+import statistics
 import sys
 import time
 import urllib.error
@@ -33,11 +34,43 @@ DEFAULT_MAX_LINES = 500
 WINDOW_MINUTES = 15
 BASELINE_HOURS = 168
 DEVIATION_TOLERANCE = 3.0
+# The ratio alone fires on any small-count bucket: 1 observed event against
+# an expected 0.2 is already an "over 3x" ratio despite being noise. The
+# sigma term is what suppresses that: a row also has to clear a margin over
+# its own measured dispersion before the gate opens. A row with no
+# dispersion estimate (no expected_stddev) falls back to the ratio alone,
+# so a baseline-query failure cannot silently disable the check.
+DEVIATION_SIGMA = 3.0
 LAST_RUN_FILE = "insights_last_run"
 
-# Structurally noisy but benign patterns, filtered at the Loki query so they
-# never travel. Ships empty: curating it needs real fleet data, not a guess.
-DENYLIST = []
+# Structurally noisy, high-volume, no-operator-value patterns, filtered at
+# the Loki query so they never travel. Curated from real logs collected on
+# the rl1 dev fleet: Prometheus's own GC/compaction chatter and its WAL
+# checkpoint line, Postgres/TimescaleDB checkpoint completion (which shares
+# the same "checkpoint complete" wording Prometheus uses), rspamd's
+# per-item timing log, and Alloy/promtail's per-node evaluation log.
+#
+# This list becomes the `!~` stage in Client.lines and Client.digest (built
+# by _filter_stages), a line filter applied to the raw journal JSON --
+# line_format runs after it. So every pattern here must match the
+# JSON-embedded text: no quote characters (JSON already escapes them, so a
+# literal `"` could never match) and no anchors (there is no line start or
+# end here, only a substring of a JSON blob). The patterns are also joined
+# into one regex alternation, so none of them may contain an unescaped
+# regex metacharacter -- none of the patterns below need one.
+#
+# Filtering at the query means these lines never travel to the collector
+# AND never reach the digest's observed/expected counts. That symmetry is
+# deliberate: dropping them from both sides at once is what keeps the
+# digest baseline undistorted by noise the model would never see anyway.
+DENYLIST = [
+    "Head GC completed",
+    "Deleting obsolete block",
+    "write block",
+    "checkpoint complete",
+    "finalize_item: slow",
+    "finished node evaluation",
+]
 
 # Field names in the cluster/subscription Redis hash. Pending confirmation
 # against a live node; the secret fallback list exists only until then.
@@ -136,15 +169,76 @@ def sanitize_line(raw):
 # Rule order is load-bearing and is documented per rule below.
 # --------------------------------------------------------------------------
 
-# Bumped by hand whenever MASKING_RULES changes. A change alters every
-# template's text, so it invalidates every server-side template and
-# fingerprint at once. Travelling in the bundle makes the resulting one-time
-# duplicate burst explainable instead of mysterious.
-MASKING_VERSION = 2
+# Bumped by hand whenever MASKING_RULES changes, or -- as of this version --
+# whenever anything else reshapes template text, such as cluster_templates()
+# below. Either kind of change alters every template's text, so it
+# invalidates every server-side template and fingerprint at once. Travelling
+# in the bundle makes the resulting one-time duplicate burst explainable
+# instead of mysterious.
+#
+# 3: single digits, percentages and decimals now fold; FQDNs become
+# <HOST>; GeoIP country codes become <CC>; "user=name" now folds to
+# <USER>; non-ISO dates become <DATE>; AND Drain-style clustering
+# (cluster_templates(), see CLUSTER_SIMILARITY below) now wildcards the
+# token positions that vary across near-duplicate templates within a
+# module. Both changes ship in this one version step on purpose, so the
+# fleet eats one invalidation burst instead of two.
+#
+# That burst is CORRELATED, not the independent trickle the server's
+# novelty gate is sized for: every template on every node goes novel in
+# the same window at once when this version first reaches a node. Do NOT
+# deploy this version before the server's LLM_MAX_CONCURRENCY limit and
+# its daily spend cap are live -- without them a fleet-wide simultaneous
+# novelty burst is an unbounded LLM bill, not a one-time blip.
+MASKING_VERSION = 3
 
 # Placeholders already present in the input are left alone, which is what
 # makes mask() idempotent. Listed here so one rule can protect all of them.
-_PLACEHOLDER = r'<(?:TS|PID|UUID|IP|PORT|HEX|NUM|PATH|USER|redacted[a-z-]*)>'
+_PLACEHOLDER = (
+    r'<(?:TS|PID|UUID|IP|PORT|HEX|NUM|PATH|USER|DATE|HOST|CC|PCT'
+    r'|redacted[a-z-]*)>'
+)
+
+# A leading "<N>" syslog priority marker, if present, is a syntactic prefix
+# `lines()`'s line_format stage always adds, not log content, and it is
+# already part of the grouping key group_templates() builds. Split off in
+# mask() below and restored verbatim, mirroring splitPriority in the
+# server's internal/model/canonical.go, so that a one-digit priority such
+# as <3> cannot be rewritten by the single-digit rule further down.
+_PRIORITY_PREFIX = re.compile(r'^<\d+>')
+
+
+def _split_priority(line):
+    """Split a leading "<N>" priority marker off `line`; ("", line) if none."""
+    match = _PRIORITY_PREFIX.match(line)
+    if not match:
+        return '', line
+    return match.group(0), line[match.end():]
+
+
+# Trailing labels that make a dotted token a file or unit name rather than a
+# host name, ported verbatim from sourceFileSuffix in the server's
+# canonical.go. Without this exclusion, source=head.go and source=compact.go
+# -- two unrelated Prometheus conditions -- would collapse into one <HOST>
+# key, and so would a three-label systemd unit name.
+_SOURCE_FILE_SUFFIX = frozenset([
+    "go", "py", "c", "h", "cc", "cpp", "js", "ts", "jsx", "tsx", "lua", "rb",
+    "php", "java", "sh", "pl", "rs", "erl", "conf", "cfg", "ini", "yaml",
+    "yml", "json", "toml", "xml", "html", "css", "log", "txt", "sql", "db",
+    "sock", "pid", "key", "crt", "pem", "so", "service", "socket", "target",
+    "timer", "mount", "slice", "scope", "device", "path",
+])
+
+
+def _mask_hostname(match):
+    """Replace a dotted name with <HOST>, unless its final label is a
+    source-file or unit-file suffix -- see _SOURCE_FILE_SUFFIX above."""
+    text = match.group(0)
+    last = text.rsplit('.', 1)[-1].lower()
+    if last in _SOURCE_FILE_SUFFIX:
+        return text
+    return '<HOST>'
+
 
 MASKING_RULES = [
     # 1. Volatile paths. Before any number rule, or /proc/12345 loses its
@@ -171,14 +265,32 @@ MASKING_RULES = [
         re.compile(r'\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b'),
         '<TS>',
     ),
-    # 4. UUIDs. Must precede the hex rule, which would otherwise shred a UUID
+    # 4. Non-ISO dates, numeric form: dd/mm/yyyy, mm-dd-yy and similar.
+    #    Placed right after the clock-time rule, ahead of the port, hex and
+    #    integer rules below, so those never see the day/month/year digits
+    #    as loose numbers. Cannot collide with the ISO-8601 rule above:
+    #    ISO always leads with a four-digit year, and this leads with one
+    #    or two digits, so whichever of the two actually applies has
+    #    already claimed the text by the time the other would look at it.
+    (
+        re.compile(r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b'),
+        '<DATE>',
+    ),
+    # 5. Non-ISO dates, the Apache/nginx access-log form ("01/Sep/2026").
+    #    Same reasoning as rule 4 for its position and for why it cannot
+    #    collide with the ISO-8601 rule.
+    (
+        re.compile(r'\b\d{1,2}/[A-Za-z]{3}/\d{4}\b'),
+        '<DATE>',
+    ),
+    # 6. UUIDs. Must precede the hex rule, which would otherwise shred a UUID
     #    into <HEX>-<HEX>-... and produce a template that never groups.
     (
         re.compile(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}'
                    r'-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'),
         '<UUID>',
     ),
-    # 5. IPv6. Must precede the hex rule for the same reason as UUIDs, and
+    # 7. IPv6. Must precede the hex rule for the same reason as UUIDs, and
     #    precede IPv4 so an IPv4-mapped form is taken whole. The compressed
     #    "::" form may be followed by several more groups, so the tail is a
     #    repeating group rather than a single optional one.
@@ -191,7 +303,7 @@ MASKING_RULES = [
                    r')(?![\w:.])'),
         '<IP>',
     ),
-    # 6. IPv4, with an optional port taken in the same match.
+    # 8. IPv4, with an optional port taken in the same match.
     #
     #    The port cannot be a separate rule with a (?<=<IP>) lookbehind: by
     #    the time that rule ran, <IP> would be a protected placeholder and
@@ -202,17 +314,33 @@ MASKING_RULES = [
         re.compile(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?::(\d{1,5}))?(?![\w.])'),
         lambda m: '<IP>:<PORT>' if m.group(1) else '<IP>',
     ),
-    # 7. The bracketed SYSLOG_IDENTIFIER `lines()` prefixes every line with
-    #    (see `line_format` in Client.lines). NS8 module instances are named
-    #    like "nethvoice84", where the trailing digits are the per-install
-    #    instance number, not signal: across the fleet they turn one event
-    #    into as many templates as there are installs. The module type
-    #    before the digits is the actual signal and is kept as-is.
+    # 9. Dotted host names. Nothing masked these before: scrub() preserves
+    #    hostnames deliberately, and masking never picked up the job, so
+    #    every node's own FQDN minted its own template for what was
+    #    otherwise the same event. Must run after the IPv4 rule (8) so an
+    #    address is already <IP> and cannot be misread as a dotted name --
+    #    though the final label class ([A-Za-z], never a digit) would
+    #    already refuse a numeric IPv4 octet on its own, so this ordering
+    #    is a second line of defence, not the only one. Pattern and the
+    #    file/unit-suffix exclusion in _mask_hostname are ported from the
+    #    server's hostname rule in canonical.go, so the two agree on what
+    #    counts as a host.
+    (
+        re.compile(r'\b(?:[A-Za-z0-9_<][A-Za-z0-9_<>-]*\.)+[A-Za-z][A-Za-z0-9]{1,23}\b'),
+        _mask_hostname,
+    ),
+    # 10. The bracketed SYSLOG_IDENTIFIER `lines()` prefixes every line with
+    #     (see `line_format` in Client.lines). NS8 module instances are
+    #     named like "nethvoice84", where the trailing digits are the
+    #     per-install instance number, not signal: across the fleet they
+    #     turn one event into as many templates as there are installs. The
+    #     module type before the digits is the actual signal and is kept
+    #     as-is.
     (
         re.compile(r'\[([A-Za-z][\w-]*?)\d+\]'),
         r'[\1]',
     ),
-    # 8. PIDs in their three common shapes. Before the bare-number rule.
+    # 11. PIDs in their three common shapes. Before the bare-number rule.
     (
         re.compile(r'\[\d+\]'),
         '[<PID>]',
@@ -225,31 +353,109 @@ MASKING_RULES = [
         re.compile(r'\((\d{2,})\)'),
         '(<PID>)',
     ),
-    # 9. Hex runs. After UUID and IPv6. Eight is the shortest run that is
-    #    more often a checksum than a word: "cafe" and "deadbeef" both exist
-    #    in prose, but eight-plus hex characters rarely do.
+    # 12. Hex runs. After UUID and IPv6. Eight is the shortest run that is
+    #     more often a checksum than a word: "cafe" and "deadbeef" both
+    #     exist in prose, but eight-plus hex characters rarely do.
     (
         re.compile(r'\b(?=[0-9a-fA-F]*\d)[0-9a-fA-F]{8,}\b'),
         '<HEX>',
     ),
-    # 10. Account names in authentication messages.
+    # 13. Account names in authentication messages, written as "user=name"
+    #     or "username=name" with no separating space. Must run before
+    #     rule 14: for "user  =  alice", rule 14's bare "\s+\S+" would
+    #     otherwise match the whitespace right up to the "=" and leave
+    #     "user <USER>  alice" instead of folding the whole assignment.
     #
-    #     Measured against six hours of real cluster logs: an SSH dictionary
-    #     attack produced 319 distinct templates that differed only by the
-    #     account being tried. Left unmasked, every window of an ongoing
-    #     attack looks like hundreds of brand-new templates, which opens the
-    #     server's novelty gate forever and defeats the cost control it
-    #     exists to provide. The retained sample line still carries the
-    #     actual account name, and the count carries the volume.
+    #     Measured against six hours of real cluster logs: an SSH
+    #     dictionary attack produced 319 distinct templates that differed
+    #     only by the account being tried. Left unmasked, every window of
+    #     an ongoing attack looks like hundreds of brand-new templates,
+    #     which opens the server's novelty gate forever and defeats the
+    #     cost control it exists to provide. The retained sample line
+    #     still carries the actual account name, and the count carries
+    #     the volume.
     (
-        re.compile(r'(?i)\b(user)\s+(?!<)[^\s]+'),
+        re.compile(r'(?i)\b(user(?:name)?)\s*=\s*(?!<)[^\s,;]+'),
+        r'\1=<USER>',
+    ),
+    # 14. The same, written "user name" with whitespace instead of "=". The
+    #     (?!<) guard on both rules is what stops a second mask() pass
+    #     from rewriting <USER> into <<USER>>.
+    (
+        re.compile(r'(?i)\b(user(?:name)?)\s+(?!<)\S+'),
         r'\1 <USER>',
     ),
-    # 11. Bare integers, last of all: every rule above embeds digits, and
-    #     running this earlier would dismantle them. Two digits minimum, so
-    #     priority markers like <3> and names like traefik1 survive.
+    # 15. GeoIP country codes written as a field, e.g. "country=US" or
+    #     "country_code: IT". The (?!<) guard does the same job as in
+    #     rules 13 and 14: it is what stops a second mask() pass from
+    #     rewriting <CC> into <<CC>>.
+    (
+        re.compile(r'(?i)\b(country(?:[_-]?code)?)(\s*[=:]\s*|\s+)(?!<)[A-Z]{2}\b'),
+        r'\1\2<CC>',
+    ),
+    # 16. GeoIP country codes as CrowdSec writes them, e.g. "(US/24)" in a
+    #     ban-scenario line. This is the shape the leak was actually
+    #     measured in: one scenario mints a template per country per ban
+    #     duration. No (?!<) guard is needed: the replacement's "(" is
+    #     followed by "<", and "<" can never satisfy the rule's own
+    #     [A-Z]{2}, so a second pass already can't rematch.
+    (
+        re.compile(r'\(([A-Z]{2})/'),
+        r'(<CC>/',
+    ),
+    # 17. Percentages. Before the decimal rule (18) below, or "1.5%" would
+    #     lose its fractional part to <NUM> and leave a stray "%" behind.
+    #     Also before the bare-integer rule (19) below: masking "34" to
+    #     <NUM> first would leave "0.<NUM> s" behind for "0.34 s", and
+    #     <NUM> is a protected placeholder by the time the decimal rule
+    #     ran, so the decimal would never fold. Must still run after the
+    #     IPv4 rule (8) so an address is already <IP> and its octets
+    #     cannot be misread as a decimal or percentage.
+    #
+    #     The server's canonical.go carries a "(?:\d+|<NUM>)" alternative
+    #     in its own percentage and decimal rules, because its integer
+    #     rule already runs first in its pipeline, so some of the digits
+    #     those rules need are already the literal text "<NUM>" by the
+    #     time they run. This collector deliberately runs the percentage
+    #     and decimal rules before the bare-integer rule instead -- that
+    #     is strictly better, because it folds "0.34" whole rather than
+    #     leaving "0.<NUM>" for the server to clean up on receipt -- so
+    #     that alternative is dead here and is dropped; plain \d+ is
+    #     enough.
+    (
+        re.compile(r'\d+(?:\.\d+)?%'),
+        '<PCT>',
+    ),
+    # 18. Decimals not already claimed as a percentage. Same reasoning as
+    #     rule 17 above for why this runs before the bare-integer rule
+    #     (19) and after the IPv4 rule (8): the alternative the server's
+    #     canonical.go needs is dead here for the same reason and is
+    #     likewise dropped.
+    (
+        re.compile(r'\d+\.\d+'),
+        '<NUM>',
+    ),
+    # 19. Bare integers, two digits or more. Left at \d{2,} rather than
+    #     \d+: lone digits are handled separately by rule 20 below, and
+    #     rules 17-18 above have already folded a percentage or a decimal
+    #     whole by the time this runs, so there is nothing left for this
+    #     rule to shred. The (?<![\w<]) / (?![\w>]) guards are what keep a
+    #     priority marker and names like traefik1 intact here; the leading
+    #     priority marker <3> is additionally protected by being split off
+    #     in mask() before any rule runs at all.
     (
         re.compile(r'(?<![\w<])\d{2,}(?![\w>])'),
+        '<NUM>',
+    ),
+    # 20. Single digits, last of all so every rule above has already
+    #     claimed the digits it needs. \b never matches inside a word, so
+    #     traefik1 and nethvoice5 are untouched by this rule specifically
+    #     -- rule 10 already renamed the former, and the latter's "5" is
+    #     simply not preceded by a word boundary. The leading priority
+    #     marker is safe because it was split off in mask(), not because
+    #     of anything in this rule.
+    (
+        re.compile(r'\b\d\b'),
         '<NUM>',
     ),
 ]
@@ -261,10 +467,16 @@ _PROTECTED = re.compile(_PLACEHOLDER)
 
 
 def mask(line):
-    """Return the template form of one already-scrubbed log line."""
+    """Return the template form of one already-scrubbed log line.
+
+    A leading "<N>" priority marker, if present, is set aside first (see
+    _split_priority) and restored verbatim, so none of the rules below --
+    in particular rule 20's single-digit rule -- can ever touch it.
+    """
+    prefix, rest = _split_priority(line)
     for pattern, replacement in MASKING_RULES:
-        line = _mask_apply(pattern, replacement, line)
-    return line
+        rest = _mask_apply(pattern, replacement, rest)
+    return prefix + rest
 
 
 def _mask_apply(pattern, replacement, line):
@@ -346,6 +558,31 @@ LOKI_TIMEOUT = 60
 HOST_BUCKET = ""
 
 
+def _filter_stages(denylist, self_identifier, include_message=False):
+    """Population-filtering LogQL stages shared by Client.digest and lines.
+
+    digest()'s observed/expected counts feed prioritisation and the
+    server's deviation gate; lines() is what the prompt's templates are
+    actually built from. An unfiltered digest would describe a population
+    the prompt never shows, and the gate could then fire on lines the
+    model never saw. Building both queries' filter stages from this one
+    function is what keeps the two from drifting apart again as either
+    query changes -- only the selector and (for lines()) the trailing
+    line_format stage differ between the two callers.
+    """
+    fields = 'priority="PRIORITY", identifier="SYSLOG_IDENTIFIER"'
+    if include_message:
+        fields += ', message="MESSAGE"'
+    stages = [
+        '| json {0}'.format(fields),
+        '| identifier != "{0}"'.format(self_identifier),
+        '| priority < 5 or category="security"',
+    ]
+    if denylist:
+        stages.append('!~ "{0}"'.format("|".join(denylist)))
+    return stages
+
+
 class LokiError(RuntimeError):
     pass
 
@@ -389,16 +626,20 @@ class Client:
                             {"start": self._ns(start), "end": self._ns(end)})
         return sorted(payload.get("data") or []) + [HOST_BUCKET]
 
-    def digest(self, at, range_seconds):
+    def digest(self, at, range_seconds, denylist, self_identifier):
         """{(module_id, priority): count} over the range ending at `at`.
 
-        Returns {} on failure. A busy cluster can exceed max_query_series on
-        this aggregation, and losing the digest costs prioritisation and the
-        `expected` field, not the run.
+        Filtered by the same stages as lines() (see _filter_stages): an
+        unfiltered aggregation would describe a population the prompt's
+        templates never show, letting the server's deviation gate fire on
+        lines the model never saw. Returns {} on failure. A busy cluster
+        can exceed max_query_series on this aggregation, and losing the
+        digest costs prioritisation and the `expected` field, not the run.
         """
-        query = ('sum by (module_id, priority) '
-                 '(count_over_time({{node_id=~".+"}} | json priority="PRIORITY" [{0}s]))'
-                 ).format(int(range_seconds))
+        stages = _filter_stages(denylist, self_identifier)
+        query = ('sum by (module_id, priority) (count_over_time('
+                 '{{node_id=~".+"}} {0} [{1}s]))'
+                 ).format(" ".join(stages), int(range_seconds))
         try:
             payload = self._get("/loki/api/v1/query",
                                 {"query": query, "time": at.isoformat()})
@@ -415,19 +656,68 @@ class Client:
             out[(labels.get("module_id", HOST_BUCKET), priority)] = value
         return out
 
+    def baseline_series(self, at, range_seconds, step_seconds, denylist,
+                        self_identifier):
+        """{(module_id, priority): [(ts_seconds, value), ...]} over the
+        `range_seconds` baseline period ending at `at`, in non-overlapping
+        `step_seconds`-wide buckets.
+
+        Same aggregation and the same _filter_stages(...) as digest() --
+        reused, not rebuilt, so the two populations cannot drift apart --
+        but run over /query_range instead of the instant /query endpoint,
+        with count_over_time's range and the request's step both set to
+        `step_seconds` so the buckets tile the period exactly once, with
+        no overlap and no gap, ready for seasonal_baseline() to bucket by
+        hour-of-week.
+
+        This is a heavier query than the instant one digest() runs:
+        query_range evaluates the aggregation once per step across the
+        whole range instead of once at a single instant, so on a busy
+        cluster it is more likely to time out or exceed max_query_series.
+        Returns {} on failure, same contract as digest(): losing this
+        baseline must cost seasonality (collect() falls back to the flat
+        one), not the run.
+        """
+        stages = _filter_stages(denylist, self_identifier)
+        query = ('sum by (module_id, priority) (count_over_time('
+                 '{{node_id=~".+"}} {0} [{1}s]))'
+                 ).format(" ".join(stages), int(step_seconds))
+        start = at - datetime.timedelta(seconds=range_seconds)
+        try:
+            payload = self._get("/loki/api/v1/query_range", {
+                "query": query,
+                "start": self._ns(start), "end": self._ns(at),
+                "step": str(int(step_seconds)),
+            })
+        except LokiError:
+            return {}
+        out = {}
+        for series in (payload.get("data") or {}).get("result") or []:
+            labels = series.get("metric") or {}
+            try:
+                priority = int(labels.get("priority", -1))
+            except (TypeError, ValueError):
+                continue
+            key = (labels.get("module_id", HOST_BUCKET), priority)
+            values = []
+            for pair in series.get("values") or []:
+                try:
+                    ts = int(float(pair[0]))
+                    value = float(pair[1])
+                except (IndexError, TypeError, ValueError):
+                    continue
+                values.append((ts, value))
+            if values:
+                out[key] = values
+        return out
+
     def lines(self, module_id, start, end, limit, denylist, self_identifier,
               direction="forward"):
         """Prefiltered lines for one module. Returns a list of (ts_ms, text)."""
         selector = ('{{module_id="{0}", node_id=~".+"}}'.format(module_id)
                     if module_id else '{node_id=~".+", module_id=""}')
-        stages = [
-            selector,
-            '| json priority="PRIORITY", identifier="SYSLOG_IDENTIFIER", message="MESSAGE"',
-            '| identifier != "{0}"'.format(self_identifier),
-            '| priority < 5 or category="security"',
-        ]
-        if denylist:
-            stages.append('!~ "{0}"'.format("|".join(denylist)))
+        stages = [selector] + _filter_stages(
+            denylist, self_identifier, include_message=True)
         stages.append(
             '| line_format "<{{.priority}}> [{{.identifier}}] {{.message}}"')
         payload = self._get("/loki/api/v1/query_range", {
@@ -448,14 +738,212 @@ class Client:
 
 
 # --------------------------------------------------------------------------
+# Seasonal baseline: bucket baseline_series() samples by hour-of-week, so a
+# bucket with a business-hours or nightly-backup shape is compared against
+# its own kind of hour instead of a flat week-long average that shape would
+# always exceed on schedule.
+# --------------------------------------------------------------------------
+
+# With step_seconds equal to the 15-minute collection window and a 168-hour
+# baseline, each hour-of-week bucket collects BASELINE_HOURS * 3600 /
+# step_seconds / 168 = 3600 / 900 = 4 samples. Three is the most that can be
+# demanded while still tolerating one missing sample out of those four.
+MIN_BASELINE_SAMPLES = 3
+
+
+def _hour_of_week(ts_seconds):
+    """UTC hour-of-week, 0-167, Monday 00:00 = 0, for a unix timestamp.
+
+    Its own function so a test can exercise the bucketing rule directly,
+    independent of seasonal_baseline()'s aggregation.
+    """
+    when = datetime.datetime.fromtimestamp(ts_seconds, datetime.timezone.utc)
+    return when.weekday() * 24 + when.hour
+
+
+def seasonal_baseline(series, target_start, minimum_samples=MIN_BASELINE_SAMPLES):
+    """{(module_id, priority): (expected, stddev, sample_count, seasonal)}
+
+    Pure and I/O-free -- `series` is whatever Client.baseline_series
+    returned, `target_start` is the collection window's start -- so it is
+    unit-testable without a Loki client.
+
+    Every sample is bucketed by its own hour-of-week (_hour_of_week). The
+    target bucket is target_start's own hour-of-week. When that bucket
+    already holds at least `minimum_samples` samples, `expected` and
+    `stddev` are that bucket's mean and population standard deviation, and
+    `seasonal` is True. Otherwise there is not yet enough history for that
+    hour of the week -- a node less than a week old, most commonly -- so
+    this falls back to the mean and population standard deviation over
+    ALL samples in the series, with `seasonal` False: the flat behaviour
+    this feature replaces, so a partial week degrades to the old baseline
+    rather than to no baseline at all.
+    """
+    target_bucket = _hour_of_week(target_start.timestamp())
+    out = {}
+    for key, samples in series.items():
+        if not samples:
+            continue
+        by_bucket = collections.defaultdict(list)
+        for ts, value in samples:
+            by_bucket[_hour_of_week(ts)].append(value)
+        target_values = by_bucket.get(target_bucket, [])
+        if len(target_values) >= minimum_samples:
+            values, seasonal = target_values, True
+        else:
+            values = [value for _, value in samples]
+            seasonal = False
+        # statistics.pstdev of a single-element list is correctly 0.0, not
+        # an error, so no extra guard is needed beyond `values` being
+        # non-empty -- guaranteed by the `if not samples: continue` above.
+        expected = statistics.fmean(values)
+        stddev = statistics.pstdev(values)
+        out[key] = (expected, stddev, len(values), seasonal)
+    return out
+
+
+# --------------------------------------------------------------------------
 # Bundle assembly: turn collected lines into the wire payload.
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 1
+# Bumped whenever a digest row's shape changes, so a receiving server knows
+# which fields to expect. 2: rows built from a seasonal baseline
+# (seasonal_baseline() via collect()) gained expected_stddev,
+# baseline_samples and baseline_seasonal.
+SCHEMA_VERSION = 2
 
 # The identifier is carried in the rendered line; the priority prefix is
 # parsed back out so templates can be grouped by it.
 PRIORITY_RE = re.compile(r'^<(\d+)>')
+
+# Drain-style clustering match-ratio threshold: the fraction of token
+# positions that must still agree for a template to join an existing
+# cluster rather than start a new one. Measured on 710 live templates from
+# three rl1 dev-fleet nodes (2026-09-01): a Drain-style pass at this
+# threshold collapsed them to 249 distinct shapes (35%), with 512 of the
+# 710 landing in a multi-member cluster -- metrics1 alone contributed 223
+# templates describing 5 conditions. At 0.5, Prometheus's `msg="Deleting
+# obsolete block"` and `msg="write block"` lines -- which share their `<3>
+# [prometheus] ... msg="..."` scaffolding but differ across enough of the
+# remaining positions -- land in two separate clusters, each keeping its
+# own literal msg= text, while positional variants of the *same* message
+# (a changed component= or a changed block id) still fold into one.
+# Raising the threshold leaves more near-duplicates uncollapsed; lowering
+# it starts merging distinct conditions like the two above into one.
+CLUSTER_SIMILARITY = 0.5
+
+
+def cluster_templates(entries):
+    """Fold near-duplicate template entries into one wildcarded shape each.
+
+    Pure and I/O-free -- no client, no I/O -- so it is unit-testable on its
+    own. `entries` is a list of the dicts group_templates() builds
+    (template, count, module_id, priority, category, first_seen, last_seen,
+    samples); the return is a new list of the same shape, with a
+    `variants` key added -- only when it is greater than 1 -- holding how
+    many raw templates folded into that entry, so an uncollapsed entry
+    stays as lean as it was before and a reader can treat an absent
+    `variants` as 1.
+
+    group_templates() calls this once per module, so module_id is already
+    constant across `entries` here and is deliberately left out of the
+    bucket key below -- adding it back would be a redundant comparison.
+
+    Bucketing: two entries are only ever compared when they agree on
+    priority, category and token count (len(template.split())) -- a
+    wildcarded pattern never changes length, so a mismatched token count
+    could never match regardless of content.
+
+    Within a bucket this is a greedy Drain-style assignment. Entries are
+    processed in a deterministic (-count, template) order first, so the
+    same input always produces the same clusters regardless of arrival
+    order -- without that, the shapes shipped would drift window to
+    window even when the underlying events do not, which would mint a
+    fresh "novel" template every run and defeat the whole point of
+    clustering. Each entry is compared position-by-position against every
+    existing cluster's current pattern: a position counts as matching only
+    when the cluster still holds literal text there AND that text equals
+    the entry's token; a position where the cluster already holds <*>
+    counts as NOT matching, which is what stops a cluster from widening
+    until it silently absorbs everything. The entry joins the first
+    cluster whose match ratio reaches CLUSTER_SIMILARITY; otherwise it
+    seeds a new cluster of its own.
+    """
+    buckets = collections.OrderedDict()
+    for entry in entries:
+        tokens = entry["template"].split()
+        key = (entry["priority"], entry["category"], len(tokens))
+        buckets.setdefault(key, []).append((entry, tokens))
+
+    out = []
+    for bucket in buckets.values():
+        bucket.sort(key=lambda pair: (-pair[0]["count"], pair[0]["template"]))
+        clusters = []
+        for entry, tokens in bucket:
+            target = None
+            # An empty template has no positions to compare, so it could
+            # never reach the threshold anyway: skipping the search is
+            # what keeps the ratio below from dividing by zero. Neither
+            # line_format nor sanitize_line() can produce one today, but
+            # the cost of being wrong about that is the whole window.
+            for cluster in (clusters if tokens else ()):
+                pattern = cluster["tokens"]
+                matches = sum(
+                    1 for i in range(len(tokens))
+                    if pattern[i] != '<*>' and pattern[i] == tokens[i]
+                )
+                if matches / len(tokens) >= CLUSTER_SIMILARITY:
+                    target = cluster
+                    break
+
+            if target is None:
+                clusters.append({
+                    "tokens": list(tokens),
+                    "variants": 1,
+                    "merged": {
+                        "template": entry["template"],
+                        "count": entry["count"],
+                        "module_id": entry["module_id"],
+                        "priority": entry["priority"],
+                        "category": entry["category"],
+                        "first_seen": entry["first_seen"],
+                        "last_seen": entry["last_seen"],
+                        "samples": list(entry["samples"]),
+                    },
+                })
+                continue
+
+            pattern = target["tokens"]
+            # Position 0 is the "<N>" priority marker line_format adds, and
+            # it is already part of the bucket key above, so it always
+            # matches here regardless. Excluded from the loop explicitly
+            # (range starts at 1) rather than relying on that -- belt and
+            # braces, so a future change to the bucket key could not
+            # silently start wildcarding it.
+            for i in range(1, len(tokens)):
+                if pattern[i] != tokens[i]:
+                    pattern[i] = '<*>'
+            merged = target["merged"]
+            merged["count"] += entry["count"]
+            merged["first_seen"] = min(merged["first_seen"], entry["first_seen"])
+            merged["last_seen"] = max(merged["last_seen"], entry["last_seen"])
+            # Same first-then-overwrite-last convention group_templates()
+            # uses for duplicate raw lines, one level up: keep the first
+            # sample seen, and let the most recently merged entry's own
+            # last sample keep overwriting the second slot.
+            if len(merged["samples"]) == 1:
+                merged["samples"].append(entry["samples"][-1])
+            else:
+                merged["samples"][1] = entry["samples"][-1]
+            target["variants"] += 1
+
+        for cluster in clusters:
+            merged = cluster["merged"]
+            merged["template"] = " ".join(cluster["tokens"])
+            if cluster["variants"] > 1:
+                merged["variants"] = cluster["variants"]
+            out.append(merged)
+    return out
 
 
 def group_templates(lines, module_id, share):
@@ -491,7 +979,16 @@ def group_templates(lines, module_id, share):
             else:
                 entry["samples"][1] = clean
 
-    ordered = sorted(groups.values(), key=lambda t: (-t["count"], t["template"]))
+    # Cluster before the sort-and-truncate-to-share step below, same
+    # reasoning as the OVERFETCH dedup-before-cap comment one level up but
+    # one level higher: clustering first means the module's line budget
+    # buys distinct *shapes* rather than near-duplicate spellings of one
+    # shape -- capping first would let a handful of near-duplicate raw
+    # templates crowd out a genuinely distinct one before clustering ever
+    # got a chance to collapse them.
+    clustered = cluster_templates(list(groups.values()))
+
+    ordered = sorted(clustered, key=lambda t: (-t["count"], t["template"]))
     kept = ordered[:share]
     for entry in kept:
         if not entry.get("category"):
@@ -581,27 +1078,87 @@ def ms(when):
     return int(when.timestamp() * 1000)
 
 
+def row_deviates(row):
+    """True when one assembled digest row deviates enough to matter.
+
+    Shared by collect() (which modules get prioritised for line budget)
+    and is_quiet() (whether the window is worth shipping at all), both
+    reading the same assembled bundle. Defined once and called from both
+    so they cannot drift apart -- two separate copies of this test could
+    disagree, and a window could then be judged quiet while one of its
+    own rows was simultaneously prioritised as deviating.
+
+    A row deviates when `expected` is present and greater than zero, the
+    observed/expected ratio exceeds DEVIATION_TOLERANCE, and -- when the
+    row carries an `expected_stddev` greater than zero -- observed also
+    clears expected by DEVIATION_SIGMA standard deviations (see
+    DEVIATION_SIGMA above for why the ratio alone is not enough). A row
+    with no dispersion estimate falls back to the ratio alone, so a
+    baseline-query failure cannot silently disable the check.
+    """
+    expected = row.get("expected", 0)
+    if not expected or expected <= 0:
+        return False
+    if row["observed"] / expected <= DEVIATION_TOLERANCE:
+        return False
+    stddev = row.get("expected_stddev", 0)
+    if stddev and stddev > 0:
+        return row["observed"] > expected + DEVIATION_SIGMA * stddev
+    return True
+
+
 def collect(client, window, max_lines, self_identifier, system_id):
     start, end = window
     modules = client.module_ids(start, end)
 
     window_seconds = (end - start).total_seconds()
-    observed = client.digest(end, window_seconds)
-    baseline = client.digest(end, BASELINE_HOURS * 3600)
+    observed = client.digest(end, window_seconds, DENYLIST, self_identifier)
     digest_available = bool(observed)
+
+    # Seasonal baseline, bucketed by hour-of-week (seasonal_baseline): a
+    # flat 168-hour mean fires the deviation gate on any bucket with a
+    # business-hours or nightly-backup shape, because that shape exceeds
+    # 3x its own week-long average on schedule, every day, by design.
+    # step_seconds == window_seconds, so each baseline sample already
+    # covers the same duration as the observed window -- unlike the flat
+    # fallback below, a seasonal `expected` needs NO rescaling.
+    series = client.baseline_series(end, BASELINE_HOURS * 3600,
+                                    int(window_seconds), DENYLIST,
+                                    self_identifier)
+    seasonal = seasonal_baseline(series, start) if series else {}
+
+    # baseline_series() is the heavier query and can time out or exceed a
+    # limit where the cheap flat digest() still succeeds. Falling back to
+    # the old flat arithmetic here -- scaled, unlike the seasonal path
+    # above -- is what keeps a node whose baseline query is too heavy on
+    # today's behaviour instead of losing `expected` entirely. This is the
+    # reason the flat arithmetic still exists in this file at all.
+    baseline = {}
+    if not series:
+        baseline = client.digest(end, BASELINE_HOURS * 3600, DENYLIST,
+                                 self_identifier)
 
     # Digest rows, and the set of modules that deviate from baseline.
     digest_rows, deviating = [], set()
     for (module_id, priority), count in sorted(observed.items()):
         row = {"module_id": module_id, "priority": priority,
                "observed": int(count)}
-        base = baseline.get((module_id, priority))
-        if base:
-            expected = base / BASELINE_HOURS * (window_seconds / 3600.0)
+        key = (module_id, priority)
+        if key in seasonal:
+            expected, stddev, sample_count, is_seasonal = seasonal[key]
             if expected > 0:
                 row["expected"] = round(expected, 3)
-                if count / expected > DEVIATION_TOLERANCE:
-                    deviating.add(module_id)
+                row["expected_stddev"] = round(stddev, 3)
+                row["baseline_samples"] = sample_count
+                row["baseline_seasonal"] = is_seasonal
+        else:
+            base = baseline.get(key)
+            if base:
+                expected = base / BASELINE_HOURS * (window_seconds / 3600.0)
+                if expected > 0:
+                    row["expected"] = round(expected, 3)
+        if row_deviates(row):
+            deviating.add(module_id)
         digest_rows.append(row)
 
     shares = allocate(modules, max_lines, prioritised=deviating)
@@ -690,6 +1247,26 @@ def mark_last_run():
         print("could not write {0}: {1}".format(LAST_RUN_FILE, exc), file=sys.stderr)
 
 
+def is_quiet(payload):
+    """True when a bundle has nothing worth shipping.
+
+    A window is quiet when it produced no templates at all and no digest
+    row deviates enough from its own baseline to matter (row_deviates,
+    shared with collect() so the two decisions cannot disagree -- a
+    window judged quiet here must never contain a row collect() itself
+    prioritised as deviating). Reads only payload["templates"] and
+    payload["digest"], so this is a pure function of the assembled bundle
+    and can be tested without a Loki client.
+
+    Suppressing a quiet window saves the HTTP round trip and the server's
+    ingest work, but not LLM cost: the server's own gate already declines
+    an empty bundle before it would spend a token on one.
+    """
+    if payload["templates"]:
+        return False
+    return not any(row_deviates(row) for row in payload["digest"])
+
+
 def collect_and_ship(client, window, max_lines, module_id, url, verify):
     """Run one window end-to-end. Returns True if the bundle shipped."""
     system_id, secret = read_identity()
@@ -704,6 +1281,16 @@ def collect_and_ship(client, window, max_lines, module_id, url, verify):
     except LokiError as exc:
         print("collection failed: {0}".format(exc), file=sys.stderr)
         return False
+
+    if is_quiet(payload):
+        print("window {0}-{1}: quiet, suppressed".format(
+            payload["window"]["start"], payload["window"]["end"]))
+        # Still record the run: get-configuration reads LAST_RUN_FILE to
+        # report collector health, and skipping this write on a suppressed
+        # window would make a healthy quiet node look stalled instead of
+        # idle.
+        mark_last_run()
+        return True
 
     try:
         status, text = ship(payload, url, system_id, secret, verify=verify)
