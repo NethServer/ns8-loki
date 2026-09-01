@@ -140,7 +140,7 @@ def sanitize_line(raw):
 # template's text, so it invalidates every server-side template and
 # fingerprint at once. Travelling in the bundle makes the resulting one-time
 # duplicate burst explainable instead of mysterious.
-MASKING_VERSION = 1
+MASKING_VERSION = 2
 
 # Placeholders already present in the input are left alone, which is what
 # makes mask() idempotent. Listed here so one rule can protect all of them.
@@ -202,7 +202,17 @@ MASKING_RULES = [
         re.compile(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?::(\d{1,5}))?(?![\w.])'),
         lambda m: '<IP>:<PORT>' if m.group(1) else '<IP>',
     ),
-    # 7. PIDs in their three common shapes. Before the bare-number rule.
+    # 7. The bracketed SYSLOG_IDENTIFIER `lines()` prefixes every line with
+    #    (see `line_format` in Client.lines). NS8 module instances are named
+    #    like "nethvoice84", where the trailing digits are the per-install
+    #    instance number, not signal: across the fleet they turn one event
+    #    into as many templates as there are installs. The module type
+    #    before the digits is the actual signal and is kept as-is.
+    (
+        re.compile(r'\[([A-Za-z][\w-]*?)\d+\]'),
+        r'[\1]',
+    ),
+    # 8. PIDs in their three common shapes. Before the bare-number rule.
     (
         re.compile(r'\[\d+\]'),
         '[<PID>]',
