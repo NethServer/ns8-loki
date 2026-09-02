@@ -807,10 +807,11 @@ def seasonal_baseline(series, target_start, minimum_samples=MIN_BASELINE_SAMPLES
 # --------------------------------------------------------------------------
 
 # Bumped whenever a digest row's shape changes, so a receiving server knows
-# which fields to expect. 2: rows built from a seasonal baseline
-# (seasonal_baseline() via collect()) gained expected_stddev,
-# baseline_samples and baseline_seasonal.
-SCHEMA_VERSION = 2
+# which fields to expect. The deployed server still only accepts 1: the new
+# fields (expected_stddev, baseline_samples, baseline_seasonal, variants) are
+# additive and the server ignores unknown JSON fields, so this stays at 1
+# until the server explicitly opts in to a 2 it understands.
+SCHEMA_VERSION = 1
 
 # The identifier is carried in the rendered line; the priority prefix is
 # parsed back out so templates can be grouped by it.
