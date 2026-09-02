@@ -29,7 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-COLLECTOR_VERSION = "2.0.0"
+COLLECTOR_VERSION = "2.1.0"
 DEFAULT_MAX_LINES = 500
 WINDOW_MINUTES = 15
 BASELINE_HOURS = 168
@@ -184,13 +184,20 @@ def sanitize_line(raw):
 # module. Both changes ship in this one version step on purpose, so the
 # fleet eats one invalidation burst instead of two.
 #
+# 4: rule 10 now also folds the instance number out of a bracketed
+# identifier containing "@" or ".", so the NS8 agent's SYSLOG_IDENTIFIER
+# `[agent@openldap55]` becomes `[agent@openldap]`. Measured on the
+# 2026-09-02 dump of live system_templates rows, that single line held 154
+# of the 678 distinct rows -- one per module instance, across seven
+# families -- because `@` was missing from rule 10's character class.
+#
 # That burst is CORRELATED, not the independent trickle the server's
 # novelty gate is sized for: every template on every node goes novel in
 # the same window at once when this version first reaches a node. Do NOT
 # deploy this version before the server's LLM_MAX_CONCURRENCY limit and
 # its daily spend cap are live -- without them a fleet-wide simultaneous
 # novelty burst is an unbounded LLM bill, not a one-time blip.
-MASKING_VERSION = 3
+MASKING_VERSION = 4
 
 # Placeholders already present in the input are left alone, which is what
 # makes mask() idempotent. Listed here so one rule can protect all of them.
@@ -336,8 +343,19 @@ MASKING_RULES = [
     #     turn one event into as many templates as there are installs. The
     #     module type before the digits is the actual signal and is kept
     #     as-is.
+    #
+    #     `@` and `.` are in the class because an NS8 agent identifies
+    #     itself as `agent@openldap55`, and scrub()'s email rule preserves
+    #     that name deliberately (see its negative lookahead above) so it
+    #     reaches masking intact. What keeps the rule narrow is not the
+    #     class but the anchoring: the digits have to be the last thing
+    #     before the `]`, so `[php7:error]`, `[nextcloud]`,
+    #     `[sshd-session]` and `[systemd-logind]` are all untouched, and
+    #     the rule is idempotent because its own output never ends in a
+    #     digit. Kept character-for-character in step with the identical
+    #     rule in the server's model.CanonicalTemplate.
     (
-        re.compile(r'\[([A-Za-z][\w-]*?)\d+\]'),
+        re.compile(r'\[([A-Za-z][\w@.-]*?)\d+\]'),
         r'[\1]',
     ),
     # 11. PIDs in their three common shapes. Before the bare-number rule.
@@ -492,13 +510,59 @@ def _mask_apply(pattern, replacement, line):
 
 
 # --------------------------------------------------------------------------
+# Module families.
+#
+# An NS8 module instance id is the image name followed by an instance
+# number, so nethvoice5 and nethvoice39 are two installs of ONE module,
+# running the same image, the same version and the same code path. Templates
+# are collected per family for that reason -- see collect() below.
+# --------------------------------------------------------------------------
+
+def module_family(module_id):
+    """Reduce an NS8 module instance id to the module it is an instance of.
+
+    nethvoice5 and nethvoice39 are both nethvoice; nethvoice-proxy4 is
+    nethvoice-proxy. An instance id is the image name followed by a
+    sequence number, so this is a naming convention rather than a
+    heuristic.
+
+    The empty module id -- HOST_BUCKET, which carries sshd, systemd and
+    runagent -- maps to itself and stays an ordinary bucket.
+
+    The result never ends in a digit, so this is idempotent: a family may
+    be handed back in where an instance id is expected without changing.
+
+    Deliberately the same rule as model.ModuleFamily in the server, which
+    keys novelty, the system_templates row and prompt grouping on it. The
+    two must agree: if the collector shipped a family the server would not
+    derive, a template the store already knew would read as novel.
+
+    The one shape this gets wrong is a module whose image name genuinely
+    ends in a digit, which would merge with a differently-numbered
+    sibling. No NS8 module on the dev fleet does, and both would have to
+    be installed on the same node for it to matter.
+    """
+    family = module_id.rstrip("0123456789")
+    if not family:
+        return module_id
+    return family
+
+
+# --------------------------------------------------------------------------
 # Line-budget allocation: divide the line budget between modules, fairly.
 # --------------------------------------------------------------------------
 
-# Every module is guaranteed this many lines before any weighting applies.
-# This is what actually fixes starvation: a crash-looping module can no
-# longer consume the whole budget, because every other module's floor is
-# reserved first.
+# Every module family is guaranteed this many lines before any weighting
+# applies. This is what actually fixes starvation: a crash-looping module
+# can no longer consume the whole budget, because every other module's
+# floor is reserved first.
+#
+# The floor is only reachable if the caller hands allocate() families
+# rather than instances. On a hosting node with 185 instances across 16
+# families, 185 * 20 is already past DEFAULT_MAX_LINES, so the degrade
+# path below would give every bucket 500 // 185 = 2 lines -- including the
+# host bucket, which carries the majority of security-relevant traffic. At
+# 16 families, 16 * 20 = 320 < 500 and the floor holds.
 MIN_SHARE = 20
 
 # Deviating or security-carrying modules get this much of the remainder
@@ -514,9 +578,14 @@ OVERFETCH = 4
 OVERFETCH_CEILING = 2000
 
 
-def allocate(module_ids, max_lines, prioritised=()):
-    """Return {module_id: share}. The total never exceeds max_lines."""
-    modules = list(module_ids)
+def allocate(buckets, max_lines, prioritised=()):
+    """Return {bucket: share}. The total never exceeds max_lines.
+
+    `buckets` are module families as collect() calls this (see MIN_SHARE
+    above for why families rather than instances), but the arithmetic here
+    is agnostic: it divides a budget between whatever keys it is handed.
+    """
+    modules = list(buckets)
     if not modules:
         return {}
 
@@ -556,6 +625,22 @@ LOKI_TIMEOUT = 60
 # these lines are the majority of security-relevant traffic, so dropping them
 # would defeat the point of the collector.
 HOST_BUCKET = ""
+
+# Characters that need escaping before a module family can be dropped into a
+# LogQL regex matcher. Family names are container image names, so in practice
+# nothing matches and this is a no-op; a family carrying a "." would
+# otherwise be a regex wildcard matching a sibling image.
+_REGEX_UNSAFE = re.compile(r'[^A-Za-z0-9_-]')
+
+
+def _logql_regex_literal(text):
+    r"""Escape `text` for use as literal text inside a LogQL regex matcher.
+
+    The backslash is doubled because a LogQL string literal processes Go
+    escape sequences of its own before the regex engine sees the pattern,
+    and `\.` is not one of them -- it is a parse error, not a literal dot.
+    """
+    return _REGEX_UNSAFE.sub(lambda m: '\\\\' + m.group(0), text)
 
 
 def _filter_stages(denylist, self_identifier, include_message=False):
@@ -711,11 +796,32 @@ class Client:
                 out[key] = values
         return out
 
-    def lines(self, module_id, start, end, limit, denylist, self_identifier,
+    def lines(self, family, start, end, limit, denylist, self_identifier,
               direction="forward"):
-        """Prefiltered lines for one module. Returns a list of (ts_ms, text)."""
-        selector = ('{{module_id="{0}", node_id=~".+"}}'.format(module_id)
-                    if module_id else '{node_id=~".+", module_id=""}')
+        """Prefiltered lines for one module family.
+
+        Returns a list of (ts_ms, text, category).
+
+        `family` is a module_family() result, so this is ONE query for
+        every instance of a module rather than one per instance: on a
+        hosting node with 185 instances across 16 families that is 16
+        query_range calls instead of 185, which is the largest single cost
+        in a collector run. It is also what lets group_templates()
+        deduplicate and cluster across a family's whole page.
+
+        Loki anchors a label regex matcher at both ends, so "nethvoice"
+        plus a digit tail cannot match the sibling image
+        nethvoice-proxy4 -- a `.*`-style pattern would. The digit tail is
+        `*` and not `+` so an unnumbered instance id, whose family is
+        itself, is still collected rather than silently dropped.
+
+        HOST_BUCKET keeps its exact-match empty-string form: an empty
+        family would otherwise leave a bare `[0-9]*`, which matches every
+        module on the node.
+        """
+        selector = ('{{module_id=~"{0}[0-9]*", node_id=~".+"}}'.format(
+                        _logql_regex_literal(family))
+                    if family else '{node_id=~".+", module_id=""}')
         stages = [selector] + _filter_stages(
             denylist, self_identifier, include_message=True)
         stages.append(
@@ -846,9 +952,16 @@ def cluster_templates(entries):
     stays as lean as it was before and a reader can treat an absent
     `variants` as 1.
 
-    group_templates() calls this once per module, so module_id is already
-    constant across `entries` here and is deliberately left out of the
-    bucket key below -- adding it back would be a redundant comparison.
+    group_templates() calls this once per module FAMILY, so module_id is
+    already constant across `entries` here and is deliberately left out of
+    the bucket key below -- adding it back would be a redundant
+    comparison. Family scope is also what makes this pass worth running at
+    all: called per instance, the 82 byte-identical
+    `pam_unix(cron:session)` templates of 82 nethvoice instances each
+    formed a cluster of one and all 82 shipped. A family-keyed bucket key
+    would be the alternative if the caller ever went back to per-instance
+    -- a global pass would let [nethvoice] and [openldap] lines with the
+    same token count merge on a 0.5 match ratio.
 
     Bucketing: two entries are only ever compared when they agree on
     priority, category and token count (len(template.split())) -- a
@@ -953,6 +1066,12 @@ def group_templates(lines, module_id, share):
     `lines` is [(ts_ms, text, category)]. Returns (templates, kept, fetched).
     Templates are emitted most-frequent-first and truncated to `share`, so a
     module's budget buys distinct events rather than repetitions of one.
+
+    `module_id` is a module family as collect() calls this: one call per
+    family over that family's whole page, so the (template, priority,
+    category) dedup below collapses lines that are byte-identical across
+    two instances of one module before clustering or capping ever sees
+    them. Per instance, they could not meet.
     """
     groups = collections.OrderedDict()
     for ts, raw, category in lines:
@@ -1112,6 +1231,24 @@ def collect(client, window, max_lines, self_identifier, system_id):
     start, end = window
     modules = client.module_ids(start, end)
 
+    # Templates are collected per module family, not per instance: two
+    # instances of one module run the same image and the same code path,
+    # so per-instance collection buys 185 copies of one condition on a
+    # hosting node while starving every bucket down to MIN_SHARE's
+    # unreachable-floor degrade path (see MIN_SHARE). Deriving the list
+    # here rather than in Client.module_ids keeps the label endpoint
+    # returning what Loki actually holds.
+    #
+    # NOTE for the server side: templates[] and budget.truncated_modules
+    # now carry families while digest[] still carries instances, so
+    # model.Bundle.ExcludeModules -- which matches PIPELINE_EXCLUDE_MODULES
+    # against all three by exact module id -- must apply model.ModuleFamily
+    # to both sides before this collector version reaches a node running
+    # that filter. Otherwise `crowdsec1` keeps excluding the digest rows
+    # and stops excluding the templates, which is the split-scope failure
+    # the filter exists to prevent.
+    families = sorted({module_family(module_id) for module_id in modules})
+
     window_seconds = (end - start).total_seconds()
     observed = client.digest(end, window_seconds, DENYLIST, self_identifier)
     digest_available = bool(observed)
@@ -1139,7 +1276,11 @@ def collect(client, window, max_lines, self_identifier, system_id):
         baseline = client.digest(end, BASELINE_HOURS * 3600, DENYLIST,
                                  self_identifier)
 
-    # Digest rows, and the set of modules that deviate from baseline.
+    # Digest rows, and the set of module INSTANCES that deviate from
+    # baseline. Unlike templates[], digest[] stays keyed on the instance on
+    # purpose: the server's module_baselines and its deviation gate are
+    # per-instance so that one instance flooding is still visible instead
+    # of averaged out across its siblings.
     digest_rows, deviating = [], set()
     for (module_id, priority), count in sorted(observed.items()):
         row = {"module_id": module_id, "priority": priority,
@@ -1162,18 +1303,23 @@ def collect(client, window, max_lines, self_identifier, system_id):
             deviating.add(module_id)
         digest_rows.append(row)
 
-    shares = allocate(modules, max_lines, prioritised=deviating)
+    # The weighting input is folded to families the same way the buckets
+    # are, or a deviating instance would weight a key allocate() never
+    # sees.
+    shares = allocate(
+        families, max_lines,
+        prioritised={module_family(module_id) for module_id in deviating})
 
     templates, truncated = [], []
     lines_seen = lines_kept = 0
-    for module_id in modules:
-        share = shares.get(module_id, MIN_SHARE)
+    for family in families:
+        share = shares.get(family, MIN_SHARE)
         limit = fetch_limit(share)
         try:
-            forward = client.lines(module_id, start, end, limit,
+            forward = client.lines(family, start, end, limit,
                                    DENYLIST, self_identifier, "forward")
         except LokiError as exc:
-            print("module {0}: {1}".format(module_id or "<host>", exc),
+            print("module {0}: {1}".format(family or "<host>", exc),
                   file=sys.stderr)
             continue
 
@@ -1182,7 +1328,7 @@ def collect(client, window, max_lines, self_identifier, system_id):
             # Only now pay for a second page, so a late-developing incident
             # is not hidden behind an early burst.
             try:
-                backward = client.lines(module_id, start, end, limit // 2,
+                backward = client.lines(family, start, end, limit // 2,
                                         DENYLIST, self_identifier, "backward")
             except LokiError:
                 backward = []
@@ -1190,16 +1336,17 @@ def collect(client, window, max_lines, self_identifier, system_id):
         else:
             page = forward
 
-        module_templates, kept, fetched = group_templates(
-            page, module_id, share)
-        templates.extend(module_templates)
+        family_templates, kept, fetched = group_templates(
+            page, family, share)
+        templates.extend(family_templates)
         lines_seen += fetched
         lines_kept += kept
 
         if hit_cap:
-            total = sum(int(c) for (m, _p), c in observed.items() if m == module_id)
+            total = sum(int(c) for (m, _p), c in observed.items()
+                        if module_family(m) == family)
             truncated.append({
-                "module_id": module_id,
+                "module_id": family,
                 "dropped": max(0, total - fetched) if digest_available else 0,
                 # Without this flag a module that hit the cap during a digest
                 # outage reports dropped=0 and is indistinguishable from a
