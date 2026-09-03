@@ -8,8 +8,11 @@
 #
 # Resume the insights collector after a restore.
 #
-# Timer enablement is not module state, so without this step a restored node
-# comes back with the collector configured but never firing.
+# Unit enablement is not module state, so without this step a restored node
+# comes back with the collector configured but never running.
+#
+# The tail cursor is deliberately not restored: a node coming back should
+# follow the log from now, not replay everything since the backup.
 #
 
 import os

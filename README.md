@@ -100,12 +100,17 @@ Note: `active_to` field WILL miss if the instance is still active.
 
 ### `set-insights`
 
-Configure the insights collector. Every 15 minutes it collects a window
-of the cluster journal, scrubs likely secrets, masks variable text,
-deduplicates the result into counted templates, and ships the bundle to the
-Nethesis insights service, where the actual (LLM-based) analysis happens.
-The node performs no analysis and holds no LLM credential. Disabled by
-default.
+Configure the insights collector. It follows the cluster journal
+continuously — scrubbing likely secrets, masking variable text and folding
+each line into counted templates as it arrives — and every 15 minutes ships
+what it has accumulated to the Nethesis insights service, where the actual
+(LLM-based) analysis happens. The node performs no analysis and holds no LLM
+credential. Disabled by default.
+
+Only a bounded number of distinct templates is held in memory between two
+bundles; past that, the least recently seen one is discarded. The per-module
+counts a bundle carries are not subject to that cap, so a discarded template
+still shows up in the counts.
 
 #### Parameters
 
@@ -172,20 +177,25 @@ runagent -m loki1 ../bin/insights-collector --print
 | Flag | Effect |
 |------|--------|
 | `--print` | build the bundle and write it to stdout instead of shipping; needs no subscription and no server URL |
-| `--max-lines N` | cap on log lines read per window, before deduplication. Default `500` |
+| `--max-lines N` | cap on the templates a bundle may carry, divided between module families. Default `500` |
 | `--minutes N` | window size in minutes. Default `15` |
-| `--daemon` | loop forever, shipping one window every `--minutes` instead of exiting after one; this is how `systemctl --user start insights-collector.service` runs it |
+| `--daemon` | follow the log stream, shipping a bundle every `--minutes`, instead of collecting one closed window and exiting; this is how `systemctl --user start insights-collector.service` runs it |
 
-Without `--daemon`, a run covers one window and exits — useful for manual
-testing. As a long-running daemon, a failed window is logged and the loop
-continues to the next one rather than exiting.
+Without `--daemon`, a run reads one already-closed window and exits — useful
+for manual testing, and deterministic in a way that watching the daemon is
+not. As a long-running daemon, it reads forward from a cursor it keeps in
+`insights_stream_cursor` in the module state directory, so a restart resumes
+where it stopped instead of losing whatever it had not yet shipped. A failed
+read is logged and retried on the next pass, leaving the cursor where it was;
+a failed ship is logged and the loop continues to the next window.
 
 #### Sizing
 
 What ships is deduplicated *templates*, not raw log lines, so the outbound
 volume is far below the raw line count of a window. `--max-lines` caps how
-many lines are read per window before deduplication, 500 by default. Check
-your own figure with `--print` before enabling the timer.
+many templates a bundle may carry, 500 by default, divided between module
+families with a floor each so a chatty module cannot starve the rest. Check
+your own figure with `--print` before enabling the collector.
 
 #### Privacy
 
@@ -198,8 +208,10 @@ the `scrub()` function in `imageroot/bin/insights-collector`
 removes likely secrets (`password=`, `token=`, `api_key=`, `Authorization`
 headers, long base64 runs, email addresses), and `mask()` in the same file
 replaces variable text (timestamps, PIDs, addresses, UUIDs and similar) so
-that repeated events collapse to one template. This is defence in depth,
-not a guarantee.
+that repeated events collapse to one template. Both passes run as the line
+is read, so an unscrubbed line is never held in memory for a whole window.
+Each template carries at most two example lines, truncated to 512
+characters. This is defence in depth, not a guarantee.
 
 The destination is the Nethesis insights service, authenticated with the
 subscription identity (`system_id` and secret) the node already holds —

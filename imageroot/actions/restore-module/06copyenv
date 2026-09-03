@@ -22,8 +22,8 @@ for evar in [
     ]:
     agent.set_env(evar, original_environment[evar])
 
-# Timer enablement is not part of module state, so 95insights re-enables the
-# insights-collector timer from these values after a restore. Without them a
+# Unit enablement is not part of module state, so 95insights re-enables the
+# insights-collector daemon from these values after a restore. Without them a
 # previously-configured collector would come back silently disabled. These
 # are optional, because insights is disabled by default.
 for evar in [

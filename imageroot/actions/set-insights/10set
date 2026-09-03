@@ -26,8 +26,8 @@ if request['active']:
     agent.set_env('INSIGHTS_SERVER_URL', request['base_url'].rstrip('/'))
     agent.set_env('INSIGHTS_VERIFY_TLS', '1' if request.get('verify_tls', True) else '0')
 
-    # Unlike the old oneshot-per-fire timer, the collector is now a
-    # long-running daemon that reads its environment once at startup, so a
+    # The collector is a long-running daemon that follows the log stream
+    # and reads its environment once at startup, so a
     # reconfigure while already active needs an explicit restart to pick up
     # the new base_url/verify_tls. `enable` (no --now) then `restart` covers
     # both a first activation (restart on a stopped unit just starts it) and

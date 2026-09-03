@@ -86,9 +86,9 @@ insights["verify_tls"] = os.getenv('INSIGHTS_VERIFY_TLS', '1') != '0'
 # module secret of its own.
 insights["subscription_configured"] = bool(rdb.hgetall('cluster/subscription'))
 
-# The collector is a long-running daemon now, not a oneshot fired by a
-# timer, so there is no ExecMainExitTimestamp per window any more: it
-# writes its own last-successful-ship timestamp instead.
+# The collector is a long-running daemon, not a oneshot fired by a timer, so
+# there is no ExecMainExitTimestamp per window any more: it writes its own
+# last-successful-ship timestamp instead.
 try:
     with open("./insights_last_run", "r") as insights_file:
         insights["last_run"] = insights_file.read()

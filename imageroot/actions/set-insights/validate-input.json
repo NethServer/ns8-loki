@@ -7,7 +7,7 @@
     "properties": {
         "active": {
             "type": "boolean",
-            "description": "Enable or disable the insights collector timer."
+            "description": "Enable or disable the insights collector daemon."
         },
         "base_url": {
             "type": "string",
