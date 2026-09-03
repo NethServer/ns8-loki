@@ -178,7 +178,7 @@ runagent -m loki1 ../bin/insights-collector --print
 |------|--------|
 | `--print` | build the bundle and write it to stdout instead of shipping; needs no subscription and no server URL |
 | `--max-lines N` | cap on the templates a bundle may carry, divided between module families. Default `500` |
-| `--minutes N` | window size in minutes. Default `15` |
+| `--minutes N` | bundle window in minutes. Default `15`. Under `--daemon` this is how often the accumulated stream is shipped; otherwise it is the size of the one closed window that gets read. Either way it also sets the baseline bucket the digest's `expected` is measured over |
 | `--daemon` | follow the log stream, shipping a bundle every `--minutes`, instead of collecting one closed window and exiting; this is how `systemctl --user start insights-collector.service` runs it |
 
 Without `--daemon`, a run reads one already-closed window and exits — useful

@@ -3,7 +3,7 @@
 # Copyright (C) 2026 Nethesis S.r.l.
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-"""Collect one window of logs, deduplicate to templates, ship a bundle.
+"""Follow the journal, fold it into templates, ship a bundle per window.
 
 This node does no analysis. It filters, masks, counts and sends; the server
 gates, infers and stores.
@@ -1337,7 +1337,8 @@ def drain_range(client, store, since_ns, until_ns, self_identifier,
     return until_ns
 
 
-def flush(client, store, window, max_lines, self_identifier, system_id):
+def flush(client, store, window, max_lines, self_identifier, system_id,
+          minutes=WINDOW_MINUTES):
     """Turn what the store has accumulated into a bundle, and reset it.
 
     The store is drained first and unconditionally: whatever happens below,
@@ -1357,12 +1358,18 @@ def flush(client, store, window, max_lines, self_identifier, system_id):
     # business-hours or nightly-backup shape, because that shape exceeds
     # 3x its own week-long average on schedule, every day, by design.
     #
-    # The step is WINDOW_MINUTES and not the actual window length: it is
-    # what MIN_BASELINE_SAMPLES' arithmetic is sized against, and the tail
-    # loop's first window after a start or a restart is whatever the cursor
-    # left it. A `expected` computed over a step that matches the ordinary
-    # window needs no rescaling -- unlike the flat fallback below.
-    step_seconds = WINDOW_MINUTES * 60
+    # The step is the NOMINAL window (--minutes) rather than this window's
+    # actual length. The two agree for every window the boundary logic
+    # produces; they differ only for the partial one the tail loop opens on
+    # a start or a restart, where the cursor decides the start. Sizing the
+    # step off that partial length would shift the baseline buckets for one
+    # bundle, and MIN_BASELINE_SAMPLES' arithmetic is sized against a stable
+    # step. A seasonal `expected` therefore needs no rescaling -- unlike the
+    # flat fallback below -- but it does have to track --minutes: a step
+    # left at 15 minutes while the window is 5 would report an `expected`
+    # three times the population `observed` counts, and the deviation gate
+    # would quietly stop firing.
+    step_seconds = minutes * 60
     series = client.baseline_series(end, BASELINE_HOURS * 3600, step_seconds,
                                     DENYLIST, self_identifier)
     seasonal = seasonal_baseline(series, start) if series else {}
@@ -1473,7 +1480,8 @@ def flush(client, store, window, max_lines, self_identifier, system_id):
         COLLECTOR_VERSION, (ms(start), ms(end)), digest_rows, templates, budget)
 
 
-def collect_window(client, window, max_lines, self_identifier, system_id):
+def collect_window(client, window, max_lines, self_identifier, system_id,
+                   minutes=WINDOW_MINUTES):
     """One closed window, start to finish: the one-shot path.
 
     Exactly the daemon's two steps -- drain_range fills a store, flush turns
@@ -1484,7 +1492,8 @@ def collect_window(client, window, max_lines, self_identifier, system_id):
     start, end = window
     store = TemplateStore()
     drain_range(client, store, ns(start), ns(end), self_identifier)
-    return flush(client, store, window, max_lines, self_identifier, system_id)
+    return flush(client, store, window, max_lines, self_identifier, system_id,
+                 minutes)
 
 
 def ship(payload, url, system_id, secret, verify=True, timeout=60):
@@ -1573,7 +1582,8 @@ def ship_bundle(payload, system_id, secret, url, verify):
     return True
 
 
-def flush_and_ship(client, store, window, max_lines, module_id, url, verify):
+def flush_and_ship(client, store, window, max_lines, module_id, url, verify,
+                   minutes=WINDOW_MINUTES):
     """Close one window: drain the store into a bundle and send it.
 
     flush() runs before the identity check, unlike the one-shot path below.
@@ -1584,14 +1594,15 @@ def flush_and_ship(client, store, window, max_lines, module_id, url, verify):
     system_id, secret = read_identity()
     payload = flush(client, store, window, max_lines,
                     "{0}/insights-collector".format(module_id),
-                    system_id or "unknown")
+                    system_id or "unknown", minutes)
     if not system_id:
         print("no subscription found; cannot ship bundles", file=sys.stderr)
         return False
     return ship_bundle(payload, system_id, secret, url, verify)
 
 
-def collect_and_ship(client, window, max_lines, module_id, url, verify):
+def collect_and_ship(client, window, max_lines, module_id, url, verify,
+                     minutes=WINDOW_MINUTES):
     """Run one closed window end-to-end. Returns True if the bundle shipped.
 
     Identity is checked first here, before the Loki reads: a one-shot on an
@@ -1606,7 +1617,7 @@ def collect_and_ship(client, window, max_lines, module_id, url, verify):
     try:
         payload = collect_window(client, window, max_lines,
                                  "{0}/insights-collector".format(module_id),
-                                 system_id)
+                                 system_id, minutes)
     except LokiError as exc:
         print("collection failed: {0}".format(exc), file=sys.stderr)
         return False
@@ -1707,7 +1718,7 @@ def run_daemon(client, minutes, max_lines, module_id, url, verify):
         if now >= boundary + datetime.timedelta(seconds=jitter) \
                 and cursor_ns >= ns(boundary):
             flush_and_ship(client, store, (window_start, boundary), max_lines,
-                           module_id, url, verify)
+                           module_id, url, verify, minutes)
             window_start = boundary
             boundary += datetime.timedelta(minutes=minutes)
             jitter = random.uniform(0, max_jitter)
@@ -1727,8 +1738,17 @@ def run_daemon(client, minutes, max_lines, module_id, url, verify):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--max-lines", type=int, default=DEFAULT_MAX_LINES)
-    parser.add_argument("--minutes", type=int, default=WINDOW_MINUTES)
+    parser.add_argument("--max-lines", type=int, default=DEFAULT_MAX_LINES,
+                        help="most templates a bundle may carry, divided "
+                             "between module families (default: "
+                             "%(default)s)")
+    parser.add_argument("--minutes", type=int, default=WINDOW_MINUTES,
+                        help="bundle window in minutes (default: "
+                             "%(default)s). Under --daemon this is how often "
+                             "the accumulated stream is shipped; otherwise it "
+                             "is the size of the one closed window that gets "
+                             "read. Either way it also sets the baseline "
+                             "bucket the digest's `expected` is measured over")
     parser.add_argument("--print", dest="show", action="store_true",
                         help="write the bundle to stdout instead of shipping")
     parser.add_argument("--daemon", action="store_true",
@@ -1757,7 +1777,7 @@ def main(argv=None):
         try:
             payload = collect_window(client, window, args.max_lines,
                                      "{0}/insights-collector".format(module_id),
-                                     "unknown")
+                                     "unknown", args.minutes)
         except LokiError as exc:
             print("collection failed: {0}".format(exc), file=sys.stderr)
             return 1
@@ -1781,7 +1801,7 @@ def main(argv=None):
     window = compute_window(datetime.datetime.now(datetime.timezone.utc),
                             args.minutes)
     return 0 if collect_and_ship(client, window, args.max_lines, module_id,
-                                 url, verify) else 1
+                                 url, verify, args.minutes) else 1
 
 
 if __name__ == "__main__":
