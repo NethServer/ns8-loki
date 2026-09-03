@@ -43,6 +43,42 @@ DEVIATION_TOLERANCE = 3.0
 DEVIATION_SIGMA = 3.0
 LAST_RUN_FILE = "insights_last_run"
 
+# How long the tail loop waits between reads. Same cadence as the two
+# sibling forwarders in this directory (syslog-forwarder,
+# cloud-log-manager-forwarder), which is where this loop's shape comes
+# from: read forward from a persisted cursor, handle the result line by
+# line, advance the cursor, sleep, repeat.
+TICK_SECONDS = 10
+
+# Entries per tail page. Loki's default max_entries_limit_per_query; a
+# request for more is rejected outright rather than truncated, so this is a
+# ceiling and not a preference. A full page means there is more waiting, and
+# drain_range keeps reading in the same tick until a page comes back short.
+TAIL_LIMIT = 5000
+
+# Resume point for the tail loop, one integer nanosecond timestamp. Written
+# in the agent state directory beside LAST_RUN_FILE, same relative-path
+# convention as the forwarders' syslog_last_timestamp and
+# cloud_log_manager_last_timestamp.
+STREAM_CURSOR_FILE = "insights_stream_cursor"
+
+# A restart after a long outage leaves a cursor arbitrarily far in the past.
+# Replaying all of it would fold hours of logs into one window's bundle and
+# push the store (and the unit's MemoryMax) for no benefit, since the server
+# reasons about one window at a time. Skip forward instead and say so.
+MAX_CATCHUP_WINDOWS = 4
+
+# Upper bound on the delay between a window closing and its bundle being
+# POSTed. Spreads a fleet that started together; at the default window it is
+# the same 0-120s spread the timer this daemon replaced used.
+MAX_SHIP_JITTER = 120
+
+# How far behind wall-clock the tail stops reading. A line reaches Loki some
+# time after the timestamp it carries, so a cursor parked on `now` would
+# step over anything still in flight -- and the cursor only moves forward,
+# so a line skipped that way is skipped for good.
+READ_LAG_SECONDS = 30
+
 # Structurally noisy, high-volume, no-operator-value patterns, filtered at
 # the Loki query so they never travel. Curated from real logs collected on
 # the rl1 dev fleet: Prometheus's own GC/compaction chatter and its WAL
@@ -50,7 +86,7 @@ LAST_RUN_FILE = "insights_last_run"
 # the same "checkpoint complete" wording Prometheus uses), rspamd's
 # per-item timing log, and Alloy/promtail's per-node evaluation log.
 #
-# This list becomes the `!~` stage in Client.lines and Client.digest (built
+# This list becomes the `!~` stage in Client.tail and Client.digest (built
 # by _filter_stages), a line filter applied to the raw journal JSON --
 # line_format runs after it. So every pattern here must match the
 # JSON-embedded text: no quote characters (JSON already escapes them, so a
@@ -207,8 +243,8 @@ _PLACEHOLDER = (
 )
 
 # A leading "<N>" syslog priority marker, if present, is a syntactic prefix
-# `lines()`'s line_format stage always adds, not log content, and it is
-# already part of the grouping key group_templates() builds. Split off in
+# `Client.tail()`'s line_format stage always adds, not log content, and it
+# is already part of the grouping key TemplateStore builds. Split off in
 # mask() below and restored verbatim, mirroring splitPriority in the
 # server's internal/model/canonical.go, so that a one-digit priority such
 # as <3> cannot be rewritten by the single-digit rule further down.
@@ -336,8 +372,8 @@ MASKING_RULES = [
         re.compile(r'\b(?:[A-Za-z0-9_<][A-Za-z0-9_<>-]*\.)+[A-Za-z][A-Za-z0-9]{1,23}\b'),
         _mask_hostname,
     ),
-    # 10. The bracketed SYSLOG_IDENTIFIER `lines()` prefixes every line with
-    #     (see `line_format` in Client.lines). NS8 module instances are
+    # 10. The bracketed SYSLOG_IDENTIFIER the tail query prefixes every line
+    #     with (see `line_format` in Client.tail). NS8 module instances are
     #     named like "nethvoice84", where the trailing digits are the
     #     per-install instance number, not signal: across the fleet they
     #     turn one event into as many templates as there are installs. The
@@ -515,7 +551,7 @@ def _mask_apply(pattern, replacement, line):
 # An NS8 module instance id is the image name followed by an instance
 # number, so nethvoice5 and nethvoice39 are two installs of ONE module,
 # running the same image, the same version and the same code path. Templates
-# are collected per family for that reason -- see collect() below.
+# are collected per family for that reason -- see flush() below.
 # --------------------------------------------------------------------------
 
 def module_family(module_id):
@@ -569,19 +605,11 @@ MIN_SHARE = 20
 # relative to a quiet one.
 PRIORITY_WEIGHT = 3.0
 
-# Lines are fetched at OVERFETCH times a module's share, then deduplicated
-# down to that share's worth of distinct templates. Without this, "dedup
-# before capping" is impossible: Loki applies the cap at query time, before
-# the collector sees a line, so one repeated line would still consume the
-# whole allocation.
-OVERFETCH = 4
-OVERFETCH_CEILING = 2000
-
 
 def allocate(buckets, max_lines, prioritised=()):
     """Return {bucket: share}. The total never exceeds max_lines.
 
-    `buckets` are module families as collect() calls this (see MIN_SHARE
+    `buckets` are module families as flush() calls this (see MIN_SHARE
     above for why families rather than instances), but the arithmetic here
     is agnostic: it divides a budget between whatever keys it is handed.
     """
@@ -604,17 +632,14 @@ def allocate(buckets, max_lines, prioritised=()):
             for m in modules}
 
 
-def fetch_limit(share):
-    """How many raw lines to pull so dedup has something to work with."""
-    return min(OVERFETCH_CEILING, max(share, share * OVERFETCH))
-
-
 # --------------------------------------------------------------------------
 # Loki HTTP client.
 #
 # Everything goes over the HTTP API. logcli is deliberately not used: the
-# two-pass design issues one query per module per run, and a subprocess
-# spawn per module is both slower and harder to diagnose than a status code.
+# tail loop issues a query every TICK_SECONDS for the life of the daemon,
+# and a subprocess spawn per tick is both slower and harder to diagnose
+# than a status code. The two sibling forwarders in this directory do shell
+# out to logcli; this file follows their loop shape, not their transport.
 # --------------------------------------------------------------------------
 
 LOKI_TIMEOUT = 60
@@ -626,34 +651,22 @@ LOKI_TIMEOUT = 60
 # would defeat the point of the collector.
 HOST_BUCKET = ""
 
-# Characters that need escaping before a module family can be dropped into a
-# LogQL regex matcher. Family names are container image names, so in practice
-# nothing matches and this is a no-op; a family carrying a "." would
-# otherwise be a regex wildcard matching a sibling image.
-_REGEX_UNSAFE = re.compile(r'[^A-Za-z0-9_-]')
-
-
-def _logql_regex_literal(text):
-    r"""Escape `text` for use as literal text inside a LogQL regex matcher.
-
-    The backslash is doubled because a LogQL string literal processes Go
-    escape sequences of its own before the regex engine sees the pattern,
-    and `\.` is not one of them -- it is a parse error, not a literal dot.
-    """
-    return _REGEX_UNSAFE.sub(lambda m: '\\\\' + m.group(0), text)
-
 
 def _filter_stages(denylist, self_identifier, include_message=False):
     """Population-filtering LogQL stages shared by Client.digest and lines.
 
     digest()'s observed/expected counts feed prioritisation and the
-    server's deviation gate; lines() is what the prompt's templates are
+    server's deviation gate; tail() is what the prompt's templates are
     actually built from. An unfiltered digest would describe a population
     the prompt never shows, and the gate could then fire on lines the
     model never saw. Building both queries' filter stages from this one
     function is what keeps the two from drifting apart again as either
-    query changes -- only the selector and (for lines()) the trailing
+    query changes -- only the selector and (for tail()) the trailing
     line_format stage differ between the two callers.
+
+    digest() now runs only as the flat baseline fallback, so the population
+    it has to agree with is the one TemplateStore counts as it folds the
+    tail. That is why these stages still have exactly one definition.
     """
     fields = 'priority="PRIORITY", identifier="SYSLOG_IDENTIFIER"'
     if include_message:
@@ -701,20 +714,10 @@ class Client:
     def _ns(when):
         return str(int(when.timestamp() * 1e9))
 
-    def module_ids(self, start, end):
-        """Module IDs present in the window, plus the host bucket.
-
-        The label endpoint reads the index rather than series data, so unlike
-        a metric query it is not subject to max_query_series.
-        """
-        payload = self._get("/loki/api/v1/label/module_id/values",
-                            {"start": self._ns(start), "end": self._ns(end)})
-        return sorted(payload.get("data") or []) + [HOST_BUCKET]
-
     def digest(self, at, range_seconds, denylist, self_identifier):
         """{(module_id, priority): count} over the range ending at `at`.
 
-        Filtered by the same stages as lines() (see _filter_stages): an
+        Filtered by the same stages as tail() (see _filter_stages): an
         unfiltered aggregation would describe a population the prompt's
         templates never show, letting the server's deviation gate fire on
         lines the model never saw. Returns {} on failure. A busy cluster
@@ -760,7 +763,7 @@ class Client:
         whole range instead of once at a single instant, so on a busy
         cluster it is more likely to time out or exceed max_query_series.
         Returns {} on failure, same contract as digest(): losing this
-        baseline must cost seasonality (collect() falls back to the flat
+        baseline must cost seasonality (flush() falls back to the flat
         one), not the run.
         """
         stages = _filter_stages(denylist, self_identifier)
@@ -796,49 +799,50 @@ class Client:
                 out[key] = values
         return out
 
-    def lines(self, family, start, end, limit, denylist, self_identifier,
-              direction="forward"):
-        """Prefiltered lines for one module family.
+    def tail(self, since_ns, until_ns, denylist, self_identifier,
+             limit=TAIL_LIMIT):
+        """One forward page of collectable lines in [since_ns, until_ns).
 
-        Returns a list of (ts_ms, text, category).
+        Returns a list of (ts_ns, text, module_id, category), oldest first,
+        at most `limit` long. A page exactly `limit` long means Loki had
+        more to give -- see drain_range, which keeps reading.
 
-        `family` is a module_family() result, so this is ONE query for
-        every instance of a module rather than one per instance: on a
-        hosting node with 185 instances across 16 families that is 16
-        query_range calls instead of 185, which is the largest single cost
-        in a collector run. It is also what lets group_templates()
-        deduplicate and cluster across a family's whole page.
+        ONE query covers every module and the host bucket, because the
+        selector carries no module matcher. That is the whole point of
+        following the stream instead of re-querying a closed window: the
+        old per-family fetch cost one or two query_range calls per family
+        per window, and the collector had to ask Loki to hand back lines it
+        could have folded as they arrived.
 
-        Loki anchors a label regex matcher at both ends, so "nethvoice"
-        plus a digit tail cannot match the sibling image
-        nethvoice-proxy4 -- a `.*`-style pattern would. The digit tail is
-        `*` and not `+` so an unnumbered instance id, whose family is
-        itself, is still collected rather than silently dropped.
+        Timestamps are nanoseconds, not datetimes, so the caller's cursor
+        can sit exactly one nanosecond past the last line it consumed. Loki
+        treats `start` as inclusive and `end` as exclusive, so a cursor
+        parked on `until_ns` re-reads nothing and skips nothing.
 
-        HOST_BUCKET keeps its exact-match empty-string form: an empty
-        family would otherwise leave a bare `[0-9]*`, which matches every
-        module on the node.
+        Host-level records (sshd, systemd, runagent) carry no module_id
+        label at all and fall through to HOST_BUCKET, the same synthetic
+        bucket the rest of the collector already uses for them.
         """
-        selector = ('{{module_id=~"{0}[0-9]*", node_id=~".+"}}'.format(
-                        _logql_regex_literal(family))
-                    if family else '{node_id=~".+", module_id=""}')
-        stages = [selector] + _filter_stages(
+        stages = ['{node_id=~".+"}'] + _filter_stages(
             denylist, self_identifier, include_message=True)
         stages.append(
             '| line_format "<{{.priority}}> [{{.identifier}}] {{.message}}"')
         payload = self._get("/loki/api/v1/query_range", {
             "query": " ".join(stages),
-            "start": self._ns(start), "end": self._ns(end),
-            "limit": str(int(limit)), "direction": direction,
+            "start": str(int(since_ns)), "end": str(int(until_ns)),
+            "limit": str(int(limit)), "direction": "forward",
         })
-        # category is a stream label, not a line field, so it is read per
-        # series rather than parsed back out of the rendered line. Losing it
-        # would make the server's security gate condition unreachable.
+        # module_id and category are stream labels, not line fields, so both
+        # are read per series rather than parsed back out of the rendered
+        # line. Losing category would make the server's security gate
+        # condition unreachable.
         out = []
         for series in (payload.get("data") or {}).get("result") or []:
-            category = (series.get("stream") or {}).get("category", "")
-            for ns, text in series.get("values") or []:
-                out.append((int(ns) // 1000000, text, category))
+            labels = series.get("stream") or {}
+            module_id = labels.get("module_id", HOST_BUCKET)
+            category = labels.get("category", "")
+            for timestamp, text in series.get("values") or []:
+                out.append((int(timestamp), text, module_id, category))
         out.sort()
         return out
 
@@ -944,7 +948,7 @@ def cluster_templates(entries):
     """Fold near-duplicate template entries into one wildcarded shape each.
 
     Pure and I/O-free -- no client, no I/O -- so it is unit-testable on its
-    own. `entries` is a list of the dicts group_templates() builds
+    own. `entries` is a list of the dicts TemplateStore builds
     (template, count, module_id, priority, category, first_seen, last_seen,
     samples); the return is a new list of the same shape, with a
     `variants` key added -- only when it is greater than 1 -- holding how
@@ -952,7 +956,7 @@ def cluster_templates(entries):
     stays as lean as it was before and a reader can treat an absent
     `variants` as 1.
 
-    group_templates() calls this once per module FAMILY, so module_id is
+    flush() calls this once per module FAMILY, so module_id is
     already constant across `entries` here and is deliberately left out of
     the bucket key below -- adding it back would be a redundant
     comparison. Family scope is also what makes this pass worth running at
@@ -1041,7 +1045,7 @@ def cluster_templates(entries):
             merged["count"] += entry["count"]
             merged["first_seen"] = min(merged["first_seen"], entry["first_seen"])
             merged["last_seen"] = max(merged["last_seen"], entry["last_seen"])
-            # Same first-then-overwrite-last convention group_templates()
+            # Same first-then-overwrite-last convention TemplateStore
             # uses for duplicate raw lines, one level up: keep the first
             # sample seen, and let the most recently merged entry's own
             # last sample keep overwriting the second slot.
@@ -1060,80 +1064,120 @@ def cluster_templates(entries):
     return out
 
 
-def group_templates(lines, module_id, share):
-    """Deduplicate raw lines into counted templates.
+# --------------------------------------------------------------------------
+# The bounded template store.
+#
+# The collector follows the log stream continuously, so the aggregate it
+# builds between two bundles is the only thing in the process that grows
+# with traffic. It is therefore capped: a fixed number of distinct
+# templates, each holding at most two length-capped samples.
+#
+# Eviction is LRU on last-seen. A template that keeps recurring keeps
+# getting refreshed; the one discarded under pressure is the one nothing
+# has matched for longest. Note this is deliberately NOT least-frequently
+# used: a rare template is exactly the novel one the server's gate exists
+# to notice, while the frequent ones are the noise DENYLIST already
+# targets.
+#
+# Eviction only ever costs templates. observed[] is a plain counter and is
+# never evicted, so a line whose template was dropped is still counted, and
+# the digest the server's deviation gate reads stays complete.
+# --------------------------------------------------------------------------
 
-    `lines` is [(ts_ms, text, category)]. Returns (templates, kept, fetched).
-    Templates are emitted most-frequent-first and truncated to `share`, so a
-    module's budget buys distinct events rather than repetitions of one.
+# Roughly 6 MB at SAMPLE_MAX_CHARS; the unit caps the process at 256M.
+MAX_TEMPLATES = 5000
 
-    `module_id` is a module family as collect() calls this: one call per
-    family over that family's whole page, so the (template, priority,
-    category) dedup below collapses lines that are byte-identical across
-    two instances of one module before clustering or capping ever sees
-    them. Per instance, they could not meet.
+# A journal line has no inherent length limit, and every entry holds two of
+# them, so capping the entry count alone would not actually bound memory.
+SAMPLE_MAX_CHARS = 512
+
+
+class TemplateStore:
+    """Fold a stream of log lines into counted, capped templates.
+
+    This is the old group_templates() turned inside out: same masking, same
+    (template, priority, category) dedup and same first-and-last sample
+    convention, but folding one line at a time as it arrives instead of one
+    list at the end of a window.
+
+    Entries are keyed on the module FAMILY rather than the instance, so two
+    instances of one module running the same image and the same code path
+    collapse into one template -- per instance they could not meet, and 82
+    nethvoice instances shipped 82 byte-identical pam_unix templates. The
+    family is part of the key and not merely a field on the entry: two
+    DIFFERENT families that happen to mask to the same text are two
+    templates, exactly as the old per-family grouping made them.
+
+    observed[] stays keyed on the INSTANCE on purpose: the server's
+    module_baselines and its deviation gate are per-instance, so that one
+    instance flooding is still visible instead of averaged out across its
+    siblings.
+
+    Counting here rather than in a separate Loki aggregation is what makes
+    the counted population and the templated population the same population
+    by construction. They used to be two queries that had to be kept in
+    step by hand, and the server's gate fired on lines the model never saw
+    when they drifted.
     """
-    groups = collections.OrderedDict()
-    for ts, raw, category in lines:
+
+    def __init__(self, max_templates=MAX_TEMPLATES):
+        self._max = max_templates
+        # Insertion/refresh ordered: the front is the coldest entry.
+        self._entries = collections.OrderedDict()
+        self.observed = collections.Counter()
+        self.lines_seen = 0
+        self.evicted = 0
+
+    def ingest(self, ts_ms, raw, module_id, category):
         clean = sanitize_line(raw)
         template = mask(clean)
         match = PRIORITY_RE.match(clean)
         priority = int(match.group(1)) if match else 6
-        key = (template, priority, category)
-        entry = groups.get(key)
+
+        self.observed[(module_id, priority)] += 1
+        self.lines_seen += 1
+
+        sample = clean[:SAMPLE_MAX_CHARS]
+        key = (module_family(module_id), template, priority, category)
+        entry = self._entries.get(key)
         if entry is None:
-            groups[key] = {
+            self._entries[key] = {
                 "template": template, "count": 1,
-                "module_id": module_id, "priority": priority,
+                "module_id": key[0], "priority": priority,
                 "category": category,
-                "first_seen": ts, "last_seen": ts,
-                "samples": [clean],
+                "first_seen": ts_ms, "last_seen": ts_ms,
+                "samples": [sample],
             }
+            while len(self._entries) > self._max:
+                self._entries.popitem(last=False)
+                self.evicted += 1
+            return
+
+        entry["count"] += 1
+        entry["first_seen"] = min(entry["first_seen"], ts_ms)
+        entry["last_seen"] = max(entry["last_seen"], ts_ms)
+        # Keep the first and last raw line only; the server caps at 2.
+        if len(entry["samples"]) == 1:
+            entry["samples"].append(sample)
         else:
-            entry["count"] += 1
-            entry["first_seen"] = min(entry["first_seen"], ts)
-            entry["last_seen"] = max(entry["last_seen"], ts)
-            # Keep the first and last raw line only; the server caps at 2.
-            if len(entry["samples"]) == 1:
-                entry["samples"].append(clean)
-            else:
-                entry["samples"][1] = clean
+            entry["samples"][1] = sample
+        self._entries.move_to_end(key)
 
-    # Cluster before the sort-and-truncate-to-share step below, same
-    # reasoning as the OVERFETCH dedup-before-cap comment one level up but
-    # one level higher: clustering first means the module's line budget
-    # buys distinct *shapes* rather than near-duplicate spellings of one
-    # shape -- capping first would let a handful of near-duplicate raw
-    # templates crowd out a genuinely distinct one before clustering ever
-    # got a chance to collapse them.
-    clustered = cluster_templates(list(groups.values()))
+    def drain(self):
+        """Hand over the window's aggregate and reset for the next one.
 
-    ordered = sorted(clustered, key=lambda t: (-t["count"], t["template"]))
-    kept = ordered[:share]
-    for entry in kept:
-        if not entry.get("category"):
-            entry.pop("category", None)
-    return kept, sum(t["count"] for t in kept), len(lines)
-
-
-def sample_ends(forward, backward, limit):
-    """Merge a forward and a backward page, keeping both ends of the window.
-
-    A pure first-N page lets an early burst hide a late-developing incident.
-    """
-    seen = set()
-    merged = []
-    for row in list(forward) + list(backward):
-        key = (row[0], row[1])
-        if key in seen:
-            continue
-        seen.add(key)
-        merged.append(row)
-    merged.sort()
-    if len(merged) <= limit:
-        return merged
-    half = limit // 2
-    return merged[:half] + merged[-(limit - half):]
+        Returns (entries, observed, lines_seen, evicted). The caller owns
+        the returned objects; the store keeps none of them. The cursor is
+        deliberately not part of this -- it belongs to the tail loop and
+        survives a flush.
+        """
+        entries = list(self._entries.values())
+        observed, seen, evicted = self.observed, self.lines_seen, self.evicted
+        self._entries = collections.OrderedDict()
+        self.observed = collections.Counter()
+        self.lines_seen = 0
+        self.evicted = 0
+        return entries, observed, seen, evicted
 
 
 def build_bundle(system_id, collector_version, window, digest_rows, templates, budget):
@@ -1198,10 +1242,46 @@ def ms(when):
     return int(when.timestamp() * 1000)
 
 
+def ns(when):
+    return int(when.timestamp() * 1e9)
+
+
+def ns_to_datetime(value):
+    return datetime.datetime.fromtimestamp(value / 1e9, datetime.timezone.utc)
+
+
+def read_cursor():
+    """The persisted tail cursor in nanoseconds, or None to start from now.
+
+    A missing file is the normal first-start case and says nothing. Anything
+    else -- unreadable, truncated, not a number -- is reported and then
+    treated the same way: a bad cursor must cost the gap it describes, never
+    the daemon.
+    """
+    try:
+        with open(STREAM_CURSOR_FILE) as cursor_file:
+            return int(cursor_file.read().strip())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        print("{0} unusable ({1}); tailing from now".format(
+            STREAM_CURSOR_FILE, exc), file=sys.stderr)
+        return None
+
+
+def write_cursor(value):
+    try:
+        with open(STREAM_CURSOR_FILE, "w") as cursor_file:
+            cursor_file.write(str(int(value)))
+    except OSError as exc:
+        print("could not write {0}: {1}".format(STREAM_CURSOR_FILE, exc),
+              file=sys.stderr)
+
+
 def row_deviates(row):
     """True when one assembled digest row deviates enough to matter.
 
-    Shared by collect() (which modules get prioritised for line budget)
+    Shared by flush() (which modules get prioritised for line budget)
     and is_quiet() (whether the window is worth shipping at all), both
     reading the same assembled bundle. Defined once and called from both
     so they cannot drift apart -- two separate copies of this test could
@@ -1227,42 +1307,64 @@ def row_deviates(row):
     return True
 
 
-def collect(client, window, max_lines, self_identifier, system_id):
+def drain_range(client, store, since_ns, until_ns, self_identifier,
+                stop=None):
+    """Ingest every collectable line in [since_ns, until_ns) into `store`.
+
+    Returns the nanosecond cursor to resume from, or raises LokiError. On a
+    failure the caller must leave its own cursor where it was: re-reading a
+    range costs duplicate counts inside one window, whereas skipping one
+    punches a hole nothing can fill later, because the cursor only moves
+    forward.
+
+    Pages until Loki returns a short page. That inner loop is not an
+    optimisation: a tick that finds more than TAIL_LIMIT lines waiting would
+    otherwise advance by one page per TICK_SECONDS and fall permanently
+    behind on a busy node.
+    """
+    cursor = since_ns
+    while cursor < until_ns:
+        if stop is not None and stop["flag"]:
+            return cursor
+        rows = client.tail(cursor, until_ns, DENYLIST, self_identifier)
+        for timestamp, text, module_id, category in rows:
+            store.ingest(timestamp // 1000000, text, module_id, category)
+        if len(rows) < TAIL_LIMIT:
+            break
+        # A full page ends wherever it ends; resume one nanosecond past its
+        # last line so the next page neither repeats nor skips it.
+        cursor = rows[-1][0] + 1
+    return until_ns
+
+
+def flush(client, store, window, max_lines, self_identifier, system_id):
+    """Turn what the store has accumulated into a bundle, and reset it.
+
+    The store is drained first and unconditionally: whatever happens below,
+    this window's aggregate must not carry into the next one.
+
+    The baseline is the only thing still read from Loki here, and both the
+    calls that fetch it swallow their own LokiError and return {} -- losing
+    a baseline costs the `expected` field, not the bundle. So this does not
+    raise, which is what lets the daemon drain unconditionally.
+    """
     start, end = window
-    modules = client.module_ids(start, end)
-
-    # Templates are collected per module family, not per instance: two
-    # instances of one module run the same image and the same code path,
-    # so per-instance collection buys 185 copies of one condition on a
-    # hosting node while starving every bucket down to MIN_SHARE's
-    # unreachable-floor degrade path (see MIN_SHARE). Deriving the list
-    # here rather than in Client.module_ids keeps the label endpoint
-    # returning what Loki actually holds.
-    #
-    # NOTE for the server side: templates[] and budget.truncated_modules
-    # now carry families while digest[] still carries instances, so
-    # model.Bundle.ExcludeModules -- which matches PIPELINE_EXCLUDE_MODULES
-    # against all three by exact module id -- must apply model.ModuleFamily
-    # to both sides before this collector version reaches a node running
-    # that filter. Otherwise `crowdsec1` keeps excluding the digest rows
-    # and stops excluding the templates, which is the split-scope failure
-    # the filter exists to prevent.
-    families = sorted({module_family(module_id) for module_id in modules})
-
+    entries, observed, lines_seen, evicted = store.drain()
     window_seconds = (end - start).total_seconds()
-    observed = client.digest(end, window_seconds, DENYLIST, self_identifier)
-    digest_available = bool(observed)
 
     # Seasonal baseline, bucketed by hour-of-week (seasonal_baseline): a
     # flat 168-hour mean fires the deviation gate on any bucket with a
     # business-hours or nightly-backup shape, because that shape exceeds
     # 3x its own week-long average on schedule, every day, by design.
-    # step_seconds == window_seconds, so each baseline sample already
-    # covers the same duration as the observed window -- unlike the flat
-    # fallback below, a seasonal `expected` needs NO rescaling.
-    series = client.baseline_series(end, BASELINE_HOURS * 3600,
-                                    int(window_seconds), DENYLIST,
-                                    self_identifier)
+    #
+    # The step is WINDOW_MINUTES and not the actual window length: it is
+    # what MIN_BASELINE_SAMPLES' arithmetic is sized against, and the tail
+    # loop's first window after a start or a restart is whatever the cursor
+    # left it. A `expected` computed over a step that matches the ordinary
+    # window needs no rescaling -- unlike the flat fallback below.
+    step_seconds = WINDOW_MINUTES * 60
+    series = client.baseline_series(end, BASELINE_HOURS * 3600, step_seconds,
+                                    DENYLIST, self_identifier)
     seasonal = seasonal_baseline(series, start) if series else {}
 
     # baseline_series() is the heavier query and can time out or exceed a
@@ -1270,7 +1372,7 @@ def collect(client, window, max_lines, self_identifier, system_id):
     # the old flat arithmetic here -- scaled, unlike the seasonal path
     # above -- is what keeps a node whose baseline query is too heavy on
     # today's behaviour instead of losing `expected` entirely. This is the
-    # reason the flat arithmetic still exists in this file at all.
+    # only surviving caller of digest(), and the reason it still exists.
     baseline = {}
     if not series:
         baseline = client.digest(end, BASELINE_HOURS * 3600, DENYLIST,
@@ -1303,6 +1405,16 @@ def collect(client, window, max_lines, self_identifier, system_id):
             deviating.add(module_id)
         digest_rows.append(row)
 
+    # Templates are already keyed on the family by TemplateStore, so this
+    # only has to bucket them. The budget is divided between the families
+    # that actually have templates to spend it on: a family whose entries
+    # were all evicted cannot use a share, and handing it one would only
+    # shrink everybody else's. Its lines are still counted in digest[].
+    by_family = collections.OrderedDict()
+    for entry in entries:
+        by_family.setdefault(entry["module_id"], []).append(entry)
+    families = sorted(by_family)
+
     # The weighting input is folded to families the same way the buckets
     # are, or a deviating instance would weight a key allocate() never
     # sees.
@@ -1311,46 +1423,38 @@ def collect(client, window, max_lines, self_identifier, system_id):
         prioritised={module_family(module_id) for module_id in deviating})
 
     templates, truncated = [], []
-    lines_seen = lines_kept = 0
+    lines_kept = 0
     for family in families:
+        family_entries = by_family[family]
         share = shares.get(family, MIN_SHARE)
-        limit = fetch_limit(share)
-        try:
-            forward = client.lines(family, start, end, limit,
-                                   DENYLIST, self_identifier, "forward")
-        except LokiError as exc:
-            print("module {0}: {1}".format(family or "<host>", exc),
-                  file=sys.stderr)
-            continue
 
-        hit_cap = len(forward) >= limit
-        if hit_cap:
-            # Only now pay for a second page, so a late-developing incident
-            # is not hidden behind an early burst.
-            try:
-                backward = client.lines(family, start, end, limit // 2,
-                                        DENYLIST, self_identifier, "backward")
-            except LokiError:
-                backward = []
-            page = sample_ends(forward, backward, limit)
-        else:
-            page = forward
+        # Cluster before the sort-and-truncate-to-share step below:
+        # clustering first means the family's budget buys distinct *shapes*
+        # rather than near-duplicate spellings of one shape -- capping first
+        # would let a handful of near-duplicate templates crowd out a
+        # genuinely distinct one before clustering ever got a chance to
+        # collapse them.
+        clustered = cluster_templates(family_entries)
+        ordered = sorted(clustered, key=lambda t: (-t["count"], t["template"]))
+        kept = ordered[:share]
+        for entry in kept:
+            if not entry.get("category"):
+                entry.pop("category", None)
 
-        family_templates, kept, fetched = group_templates(
-            page, family, share)
-        templates.extend(family_templates)
-        lines_seen += fetched
-        lines_kept += kept
+        family_kept = sum(entry["count"] for entry in kept)
+        templates.extend(kept)
+        lines_kept += family_kept
 
-        if hit_cap:
-            total = sum(int(c) for (m, _p), c in observed.items()
-                        if module_family(m) == family)
+        if len(ordered) > share:
+            # Exact now, not estimated: observed[] and the templates are
+            # two tallies of the same stream, so there is no digest outage
+            # that can leave the two describing different populations.
+            family_observed = sum(
+                count for (module_id, _p), count in observed.items()
+                if module_family(module_id) == family)
             truncated.append({
                 "module_id": family,
-                "dropped": max(0, total - fetched) if digest_available else 0,
-                # Without this flag a module that hit the cap during a digest
-                # outage reports dropped=0 and is indistinguishable from a
-                # healthy one -- read by the server as nominal.
+                "dropped": max(0, family_observed - family_kept),
                 "truncated": True,
             })
 
@@ -1358,10 +1462,29 @@ def collect(client, window, max_lines, self_identifier, system_id):
               "lines_kept": lines_kept}
     if truncated:
         budget["truncated_modules"] = truncated
+    if evicted:
+        # An LRU quietly discarding shapes is otherwise invisible both to
+        # the server and to whoever has to decide whether MAX_TEMPLATES is
+        # still the right number.
+        budget["templates_evicted"] = evicted
 
     return build_bundle(
         system_id,
         COLLECTOR_VERSION, (ms(start), ms(end)), digest_rows, templates, budget)
+
+
+def collect_window(client, window, max_lines, self_identifier, system_id):
+    """One closed window, start to finish: the one-shot path.
+
+    Exactly the daemon's two steps -- drain_range fills a store, flush turns
+    it into a bundle -- over a bounded range instead of a moving one, so a
+    manual run and the daemon cannot diverge. Reads and writes no cursor: a
+    one-shot must not move the daemon's resume point.
+    """
+    start, end = window
+    store = TemplateStore()
+    drain_range(client, store, ns(start), ns(end), self_identifier)
+    return flush(client, store, window, max_lines, self_identifier, system_id)
 
 
 def ship(payload, url, system_id, secret, verify=True, timeout=60):
@@ -1400,8 +1523,8 @@ def is_quiet(payload):
 
     A window is quiet when it produced no templates at all and no digest
     row deviates enough from its own baseline to matter (row_deviates,
-    shared with collect() so the two decisions cannot disagree -- a
-    window judged quiet here must never contain a row collect() itself
+    shared with flush() so the two decisions cannot disagree -- a
+    window judged quiet here must never contain a row flush() itself
     prioritised as deviating). Reads only payload["templates"] and
     payload["digest"], so this is a pure function of the assembled bundle
     and can be tested without a Loki client.
@@ -1415,21 +1538,8 @@ def is_quiet(payload):
     return not any(row_deviates(row) for row in payload["digest"])
 
 
-def collect_and_ship(client, window, max_lines, module_id, url, verify):
-    """Run one window end-to-end. Returns True if the bundle shipped."""
-    system_id, secret = read_identity()
-    if not system_id:
-        print("no subscription found; cannot ship bundles", file=sys.stderr)
-        return False
-
-    try:
-        payload = collect(client, window, max_lines,
-                          "{0}/insights-collector".format(module_id),
-                          system_id)
-    except LokiError as exc:
-        print("collection failed: {0}".format(exc), file=sys.stderr)
-        return False
-
+def ship_bundle(payload, system_id, secret, url, verify):
+    """POST one assembled bundle, or explain why it did not go."""
     if is_quiet(payload):
         print("window {0}-{1}: quiet, suppressed".format(
             payload["window"]["start"], payload["window"]["end"]))
@@ -1457,9 +1567,50 @@ def collect_and_ship(client, window, max_lines, module_id, url, verify):
         return False
 
     print("shipped {0} templates, {1} lines -> {2} {3}".format(
-        len(payload["templates"]), payload["budget"]["lines_kept"], status, text.strip()))
+        len(payload["templates"]), payload["budget"]["lines_kept"], status,
+        text.strip()))
     mark_last_run()
     return True
+
+
+def flush_and_ship(client, store, window, max_lines, module_id, url, verify):
+    """Close one window: drain the store into a bundle and send it.
+
+    flush() runs before the identity check, unlike the one-shot path below.
+    An unsubscribed or unreachable node still has to let go of the window,
+    or the aggregate it cannot send grows until the LRU cap is the only
+    thing holding the process inside its MemoryMax.
+    """
+    system_id, secret = read_identity()
+    payload = flush(client, store, window, max_lines,
+                    "{0}/insights-collector".format(module_id),
+                    system_id or "unknown")
+    if not system_id:
+        print("no subscription found; cannot ship bundles", file=sys.stderr)
+        return False
+    return ship_bundle(payload, system_id, secret, url, verify)
+
+
+def collect_and_ship(client, window, max_lines, module_id, url, verify):
+    """Run one closed window end-to-end. Returns True if the bundle shipped.
+
+    Identity is checked first here, before the Loki reads: a one-shot on an
+    unconfigured node should cost nothing, not a full collection it then
+    discards. The daemon cannot do the same -- see flush_and_ship.
+    """
+    system_id, secret = read_identity()
+    if not system_id:
+        print("no subscription found; cannot ship bundles", file=sys.stderr)
+        return False
+
+    try:
+        payload = collect_window(client, window, max_lines,
+                                 "{0}/insights-collector".format(module_id),
+                                 system_id)
+    except LokiError as exc:
+        print("collection failed: {0}".format(exc), file=sys.stderr)
+        return False
+    return ship_bundle(payload, system_id, secret, url, verify)
 
 
 def _sleep_interruptible(seconds, stop):
@@ -1475,11 +1626,17 @@ def _sleep_interruptible(seconds, stop):
 
 
 def run_daemon(client, minutes, max_lines, module_id, url, verify):
-    """Loop forever: one window, then sleep to the next boundary.
+    """Follow the log stream, flushing a bundle on every window boundary.
 
-    Each iteration only holds local state (built fresh inside collect() /
-    collect_and_ship()), so nothing accumulates across iterations -- the
-    process's memory footprint should stay flat run over run.
+    The loop shape is the one the two sibling forwarders in this directory
+    use: read forward from a persisted cursor, handle the result line by
+    line, advance the cursor, sleep, repeat. The difference is what happens
+    to a line -- they write it to a socket, this masks and folds it into a
+    bounded store that a boundary then turns into a bundle.
+
+    The only state that grows is TemplateStore, and it is capped. The cursor
+    is a single integer on disk, so a restart resumes where it stopped
+    rather than losing whatever was in flight.
     """
     stop = {"flag": False}
 
@@ -1489,23 +1646,82 @@ def run_daemon(client, minutes, max_lines, module_id, url, verify):
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
+    self_identifier = "{0}/insights-collector".format(module_id)
+    store = TemplateStore()
+
+    lag = datetime.timedelta(minutes=minutes * MAX_CATCHUP_WINDOWS)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cursor_ns = read_cursor()
+    if cursor_ns is None:
+        cursor_ns = ns(now)
+    elif cursor_ns < ns(now - lag):
+        print("cursor is {0:.0f} minutes behind; skipping forward".format(
+            (ns(now) - cursor_ns) / 6e10), file=sys.stderr)
+        cursor_ns = ns(now - lag)
+
+    window_start = ns_to_datetime(cursor_ns)
+    boundary = compute_window(now, minutes)[1] + datetime.timedelta(
+        minutes=minutes)
+    # Mirrors the old timer's RandomizedDelaySec, moved from the poll to the
+    # ship: the tail has to keep up with the log regardless, but 2700 nodes
+    # must not POST /v1/bundles on the same second. Re-rolled per window.
+    # Capped at a quarter of the window as well as at MAX_SHIP_JITTER, so a
+    # short --minutes cannot spend more time waiting than collecting.
+    max_jitter = min(MAX_SHIP_JITTER, minutes * 15)
+    jitter = random.uniform(0, max_jitter)
+
     while not stop["flag"]:
         now = datetime.datetime.now(datetime.timezone.utc)
-        window = compute_window(now, minutes)
-        collect_and_ship(client, window, max_lines, module_id, url, verify)
+        if boundary < now - lag:
+            # Loki was unreachable long enough that replaying the gap would
+            # mean hundreds of windows of catch-up, each with its own
+            # baseline query and POST. Abandon the gap and resync instead.
+            print("{0:.0f} minutes behind; abandoning the gap".format(
+                (now - boundary).total_seconds() / 60), file=sys.stderr)
+            store.drain()
+            cursor_ns = ns(now - lag)
+            window_start = ns_to_datetime(cursor_ns)
+            boundary = compute_window(now, minutes)[1] + datetime.timedelta(
+                minutes=minutes)
+
+        try:
+            # Never read past the boundary while waiting out the jitter, so
+            # the store holds exactly the window it is about to be drained
+            # into and `expected` keeps comparing equal-length periods.
+            until_ns = min(time.time_ns() - READ_LAG_SECONDS * 1000000000,
+                           ns(boundary))
+            if until_ns > cursor_ns:
+                cursor_ns = drain_range(client, store, cursor_ns, until_ns,
+                                        self_identifier, stop)
+                write_cursor(cursor_ns)
+        except LokiError as exc:
+            # The cursor stays where it was, so the next tick re-reads the
+            # same range: a transient Loki restart costs a duplicate count,
+            # not a hole in the window.
+            print("tail failed: {0}".format(exc), file=sys.stderr)
+
         if stop["flag"]:
             break
 
-        # Mirrors the old timer's RandomizedDelaySec: a bit of slack past
-        # the boundary so the just-closed window's logs have settled, spread
-        # out so a fleet that started together doesn't all fire in lockstep.
-        _, end = window
-        next_boundary = end + datetime.timedelta(minutes=minutes)
-        jitter = random.uniform(0, 120)
         now = datetime.datetime.now(datetime.timezone.utc)
-        sleep_for = max(1.0, (next_boundary - now).total_seconds() + jitter)
-        _sleep_interruptible(sleep_for, stop)
+        if now >= boundary + datetime.timedelta(seconds=jitter) \
+                and cursor_ns >= ns(boundary):
+            flush_and_ship(client, store, (window_start, boundary), max_lines,
+                           module_id, url, verify)
+            window_start = boundary
+            boundary += datetime.timedelta(minutes=minutes)
+            jitter = random.uniform(0, max_jitter)
+            if stop["flag"]:
+                break
 
+        _sleep_interruptible(TICK_SECONDS, stop)
+
+    # Rewind to the start of the window that never got shipped. The store
+    # dies with the process, so leaving the cursor at the high-water mark
+    # would drop everything read since the last flush -- the one thing the
+    # persisted cursor exists to prevent. Replaying costs a duplicate read;
+    # not replaying costs the lines.
+    write_cursor(ns(window_start))
     return 0
 
 
@@ -1516,8 +1732,9 @@ def main(argv=None):
     parser.add_argument("--print", dest="show", action="store_true",
                         help="write the bundle to stdout instead of shipping")
     parser.add_argument("--daemon", action="store_true",
-                        help="loop forever, shipping one window every "
-                             "--minutes instead of exiting after one")
+                        help="follow the log stream, shipping a bundle every "
+                             "--minutes, instead of collecting one closed "
+                             "window and exiting")
     args = parser.parse_args(argv)
     if args.show and args.daemon:
         parser.error("--print and --daemon are mutually exclusive")
@@ -1538,9 +1755,9 @@ def main(argv=None):
         window = compute_window(datetime.datetime.now(datetime.timezone.utc),
                                 args.minutes)
         try:
-            payload = collect(client, window, args.max_lines,
-                              "{0}/insights-collector".format(module_id),
-                              "unknown")
+            payload = collect_window(client, window, args.max_lines,
+                                     "{0}/insights-collector".format(module_id),
+                                     "unknown")
         except LokiError as exc:
             print("collection failed: {0}".format(exc), file=sys.stderr)
             return 1
@@ -1548,8 +1765,8 @@ def main(argv=None):
         print()
         return 0
 
-    # Both cheap checks run before the Loki queries: an unconfigured node
-    # should cost nothing per fire, not a full collection it then discards.
+    # Both cheap checks run before any Loki read: an unconfigured node
+    # should cost nothing to start, not a collection it then discards.
     url = os.environ.get("INSIGHTS_SERVER_URL")
     if not url:
         print("INSIGHTS_SERVER_URL is not set", file=sys.stderr)
