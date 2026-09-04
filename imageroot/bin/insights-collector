@@ -1,0 +1,1808 @@
+#!/usr/bin/env python3
+#
+# Copyright (C) 2026 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+"""Follow the journal, fold it into templates, ship a bundle per window.
+
+This node does no analysis. It filters, masks, counts and sends; the server
+gates, infers and stores.
+
+Single file on purpose: this is the whole collector, so copying this one
+file is enough to deploy or test it manually, no sibling package needed.
+"""
+
+import argparse
+import base64
+import collections
+import datetime
+import json
+import os
+import random
+import re
+import signal
+import ssl
+import statistics
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+COLLECTOR_VERSION = "2.1.0"
+DEFAULT_MAX_LINES = 500
+WINDOW_MINUTES = 15
+BASELINE_HOURS = 168
+DEVIATION_TOLERANCE = 3.0
+# The ratio alone fires on any small-count bucket: 1 observed event against
+# an expected 0.2 is already an "over 3x" ratio despite being noise. The
+# sigma term is what suppresses that: a row also has to clear a margin over
+# its own measured dispersion before the gate opens. A row with no
+# dispersion estimate (no expected_stddev) falls back to the ratio alone,
+# so a baseline-query failure cannot silently disable the check.
+DEVIATION_SIGMA = 3.0
+LAST_RUN_FILE = "insights_last_run"
+
+# How long the tail loop waits between reads. Same cadence as the two
+# sibling forwarders in this directory (syslog-forwarder,
+# cloud-log-manager-forwarder), which is where this loop's shape comes
+# from: read forward from a persisted cursor, handle the result line by
+# line, advance the cursor, sleep, repeat.
+TICK_SECONDS = 10
+
+# Entries per tail page. Loki's default max_entries_limit_per_query; a
+# request for more is rejected outright rather than truncated, so this is a
+# ceiling and not a preference. A full page means there is more waiting, and
+# drain_range keeps reading in the same tick until a page comes back short.
+TAIL_LIMIT = 5000
+
+# Resume point for the tail loop, one integer nanosecond timestamp. Written
+# in the agent state directory beside LAST_RUN_FILE, same relative-path
+# convention as the forwarders' syslog_last_timestamp and
+# cloud_log_manager_last_timestamp.
+STREAM_CURSOR_FILE = "insights_stream_cursor"
+
+# A restart after a long outage leaves a cursor arbitrarily far in the past.
+# Replaying all of it would fold hours of logs into one window's bundle and
+# push the store (and the unit's MemoryMax) for no benefit, since the server
+# reasons about one window at a time. Skip forward instead and say so.
+MAX_CATCHUP_WINDOWS = 4
+
+# Upper bound on the delay between a window closing and its bundle being
+# POSTed. Spreads a fleet that started together; at the default window it is
+# the same 0-120s spread the timer this daemon replaced used.
+MAX_SHIP_JITTER = 120
+
+# How far behind wall-clock the tail stops reading. A line reaches Loki some
+# time after the timestamp it carries, so a cursor parked on `now` would
+# step over anything still in flight -- and the cursor only moves forward,
+# so a line skipped that way is skipped for good.
+READ_LAG_SECONDS = 30
+
+# Structurally noisy, high-volume, no-operator-value patterns, filtered at
+# the Loki query so they never travel. Curated from real logs collected on
+# the rl1 dev fleet: Prometheus's own GC/compaction chatter and its WAL
+# checkpoint line, Postgres/TimescaleDB checkpoint completion (which shares
+# the same "checkpoint complete" wording Prometheus uses), rspamd's
+# per-item timing log, and Alloy/promtail's per-node evaluation log.
+#
+# This list becomes the `!~` stage in Client.tail and Client.digest (built
+# by _filter_stages), a line filter applied to the raw journal JSON --
+# line_format runs after it. So every pattern here must match the
+# JSON-embedded text: no quote characters (JSON already escapes them, so a
+# literal `"` could never match) and no anchors (there is no line start or
+# end here, only a substring of a JSON blob). The patterns are also joined
+# into one regex alternation, so none of them may contain an unescaped
+# regex metacharacter -- none of the patterns below need one.
+#
+# Filtering at the query means these lines never travel to the collector
+# AND never reach the digest's observed/expected counts. That symmetry is
+# deliberate: dropping them from both sides at once is what keeps the
+# digest baseline undistorted by noise the model would never see anyway.
+DENYLIST = [
+    "Head GC completed",
+    "Deleting obsolete block",
+    "write block",
+    "checkpoint complete",
+    "finalize_item: slow",
+    "finished node evaluation",
+]
+
+# Field names in the cluster/subscription Redis hash. Pending confirmation
+# against a live node; the secret fallback list exists only until then.
+SUBSCRIPTION_ID_FIELD = "system_id"
+SUBSCRIPTION_SECRET_FIELDS = ("auth_token", "secret", "password")
+
+
+# --------------------------------------------------------------------------
+# Secret removal.
+#
+# Distinct from masking below: this removes secrets and deliberately
+# PRESERVES IP addresses, hostnames and module IDs because they carry
+# signal. mask() then replaces those for grouping. Both outputs are kept
+# downstream.
+# --------------------------------------------------------------------------
+
+# Ordered: keyword assignments (Bearer's space-separated value first, then
+# other secret keywords requiring an explicit assignment character), then
+# Authorization headers, then email addresses, then long opaque blobs. Email
+# runs before the blob rule so a long local part is still reported as an
+# email. Both keyword rules allow optional whitespace around the separator
+# (aligned/structured logs commonly pad it, e.g. "key : value") without
+# reopening the bare-whitespace false positive: the character class still
+# requires an actual "=", ":" or quote, which plain prose never supplies.
+SCRUB_RULES = [
+    (
+        re.compile(r'(?i)\b(bearer)\b\s*[=:\s"\']+\s*\S+'),
+        r'\1=<redacted>',
+    ),
+    (
+        re.compile(r'(?i)\b(tokens?|api[-_]?keys?|secrets?|passwords?|passwd|pwd)\b\s*[=:"\']+\s*\S+'),
+        r'\1=<redacted>',
+    ),
+    (
+        re.compile(r'(?i)\bauthorization:\s*\S+(?:\s+\S+)?'),
+        'authorization: <redacted>',
+    ),
+    # The negative lookahead keeps systemd templated unit names intact.
+    # `agent@nethvoice2.service` is not an address, and those PRIORITY=3 lines
+    # are how a crash loop names the module that is failing.
+    (
+        re.compile(
+            r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*'
+            r'\.(?!service\b|timer\b|socket\b|target\b|slice\b|scope\b|mount\b'
+            r'|path\b|device\b|swap\b|automount\b)[A-Za-z]{2,}\b'
+        ),
+        '<redacted-email>',
+    ),
+    # `/` is deliberately excluded: a long filesystem path or URL is signal,
+    # not an opaque blob, and the base64 alphabet would otherwise swallow it.
+    (
+        re.compile(r'\b[A-Za-z0-9+]{32,}={0,2}\b'),
+        '<redacted-blob>',
+    ),
+]
+
+
+WHITESPACE_RUN = re.compile(r'\s+')
+
+
+def scrub(line):
+    """Remove likely secrets from a log line.
+
+    Defence in depth, not a guarantee. IP addresses, hostnames, module IDs
+    and usernames are deliberately preserved: they carry the signal.
+    """
+    for pattern, replacement in SCRUB_RULES:
+        line = pattern.sub(replacement, line)
+    return line
+
+
+def sanitize_line(raw):
+    """Flatten a collected log line to exactly one prompt line, then scrub.
+
+    Journal messages can contain newlines. Left alone they would break the
+    one-record-per-line structure of the prompt's LINES block, letting a log
+    message forge additional lines or close the fence.
+    """
+    return scrub(WHITESPACE_RUN.sub(' ', raw).strip())
+
+
+# --------------------------------------------------------------------------
+# Masking: normalise volatile tokens so repeats collapse to one template.
+#
+# This runs *after* scrub() and does a different job. scrub() removes
+# secrets and deliberately preserves IP addresses, hostnames and module IDs
+# because they carry signal. Masking replaces exactly those volatile parts,
+# because two lines that differ only by a PID or an address are the same
+# event and must group together.
+#
+# Both outputs are kept downstream: the template (masked) is what gets
+# counted and hashed into a finding's identity, while the retained sample
+# line is the scrubbed-but-unmasked original, so an operator can still see
+# which address was actually refused.
+#
+# Rule order is load-bearing and is documented per rule below.
+# --------------------------------------------------------------------------
+
+# Bumped by hand whenever MASKING_RULES changes, or -- as of this version --
+# whenever anything else reshapes template text, such as cluster_templates()
+# below. Either kind of change alters every template's text, so it
+# invalidates every server-side template and fingerprint at once. Travelling
+# in the bundle makes the resulting one-time duplicate burst explainable
+# instead of mysterious.
+#
+# 3: single digits, percentages and decimals now fold; FQDNs become
+# <HOST>; GeoIP country codes become <CC>; "user=name" now folds to
+# <USER>; non-ISO dates become <DATE>; AND Drain-style clustering
+# (cluster_templates(), see CLUSTER_SIMILARITY below) now wildcards the
+# token positions that vary across near-duplicate templates within a
+# module. Both changes ship in this one version step on purpose, so the
+# fleet eats one invalidation burst instead of two.
+#
+# 4: rule 10 now also folds the instance number out of a bracketed
+# identifier containing "@" or ".", so the NS8 agent's SYSLOG_IDENTIFIER
+# `[agent@openldap55]` becomes `[agent@openldap]`. Measured on the
+# 2026-09-02 dump of live system_templates rows, that single line held 154
+# of the 678 distinct rows -- one per module instance, across seven
+# families -- because `@` was missing from rule 10's character class.
+#
+# That burst is CORRELATED, not the independent trickle the server's
+# novelty gate is sized for: every template on every node goes novel in
+# the same window at once when this version first reaches a node. Do NOT
+# deploy this version before the server's LLM_MAX_CONCURRENCY limit and
+# its daily spend cap are live -- without them a fleet-wide simultaneous
+# novelty burst is an unbounded LLM bill, not a one-time blip.
+MASKING_VERSION = 4
+
+# Placeholders already present in the input are left alone, which is what
+# makes mask() idempotent. Listed here so one rule can protect all of them.
+_PLACEHOLDER = (
+    r'<(?:TS|PID|UUID|IP|PORT|HEX|NUM|PATH|USER|DATE|HOST|CC|PCT'
+    r'|redacted[a-z-]*)>'
+)
+
+# A leading "<N>" syslog priority marker, if present, is a syntactic prefix
+# `Client.tail()`'s line_format stage always adds, not log content, and it
+# is already part of the grouping key TemplateStore builds. Split off in
+# mask() below and restored verbatim, mirroring splitPriority in the
+# server's internal/model/canonical.go, so that a one-digit priority such
+# as <3> cannot be rewritten by the single-digit rule further down.
+_PRIORITY_PREFIX = re.compile(r'^<\d+>')
+
+
+def _split_priority(line):
+    """Split a leading "<N>" priority marker off `line`; ("", line) if none."""
+    match = _PRIORITY_PREFIX.match(line)
+    if not match:
+        return '', line
+    return match.group(0), line[match.end():]
+
+
+# Trailing labels that make a dotted token a file or unit name rather than a
+# host name, ported verbatim from sourceFileSuffix in the server's
+# canonical.go. Without this exclusion, source=head.go and source=compact.go
+# -- two unrelated Prometheus conditions -- would collapse into one <HOST>
+# key, and so would a three-label systemd unit name.
+_SOURCE_FILE_SUFFIX = frozenset([
+    "go", "py", "c", "h", "cc", "cpp", "js", "ts", "jsx", "tsx", "lua", "rb",
+    "php", "java", "sh", "pl", "rs", "erl", "conf", "cfg", "ini", "yaml",
+    "yml", "json", "toml", "xml", "html", "css", "log", "txt", "sql", "db",
+    "sock", "pid", "key", "crt", "pem", "so", "service", "socket", "target",
+    "timer", "mount", "slice", "scope", "device", "path",
+])
+
+
+def _mask_hostname(match):
+    """Replace a dotted name with <HOST>, unless its final label is a
+    source-file or unit-file suffix -- see _SOURCE_FILE_SUFFIX above."""
+    text = match.group(0)
+    last = text.rsplit('.', 1)[-1].lower()
+    if last in _SOURCE_FILE_SUFFIX:
+        return text
+    return '<HOST>'
+
+
+MASKING_RULES = [
+    # 1. Volatile paths. Before any number rule, or /proc/12345 loses its
+    #    shape and stops matching as a path at all.
+    (
+        re.compile(r'(?:/tmp|/run|/var/tmp)/\S+'),
+        '<PATH>',
+    ),
+    (
+        re.compile(r'/proc/\d+(?:/\S*)?'),
+        '<PATH>',
+    ),
+    # 2. ISO-8601 timestamps. Before clock times, which are a prefix of them.
+    (
+        re.compile(
+            r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}'
+            r'(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?'
+        ),
+        '<TS>',
+    ),
+    # 3. Bare clock times. Before the port rule, which would otherwise claim
+    #    the ":32" tail, and before IPv6, which also uses colons.
+    (
+        re.compile(r'\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b'),
+        '<TS>',
+    ),
+    # 4. Non-ISO dates, numeric form: dd/mm/yyyy, mm-dd-yy and similar.
+    #    Placed right after the clock-time rule, ahead of the port, hex and
+    #    integer rules below, so those never see the day/month/year digits
+    #    as loose numbers. Cannot collide with the ISO-8601 rule above:
+    #    ISO always leads with a four-digit year, and this leads with one
+    #    or two digits, so whichever of the two actually applies has
+    #    already claimed the text by the time the other would look at it.
+    (
+        re.compile(r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b'),
+        '<DATE>',
+    ),
+    # 5. Non-ISO dates, the Apache/nginx access-log form ("01/Sep/2026").
+    #    Same reasoning as rule 4 for its position and for why it cannot
+    #    collide with the ISO-8601 rule.
+    (
+        re.compile(r'\b\d{1,2}/[A-Za-z]{3}/\d{4}\b'),
+        '<DATE>',
+    ),
+    # 6. UUIDs. Must precede the hex rule, which would otherwise shred a UUID
+    #    into <HEX>-<HEX>-... and produce a template that never groups.
+    (
+        re.compile(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}'
+                   r'-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'),
+        '<UUID>',
+    ),
+    # 7. IPv6. Must precede the hex rule for the same reason as UUIDs, and
+    #    precede IPv4 so an IPv4-mapped form is taken whole. The compressed
+    #    "::" form may be followed by several more groups, so the tail is a
+    #    repeating group rather than a single optional one.
+    (
+        re.compile(r'(?<![\w:.])(?:'
+                   r'(?:[0-9a-fA-F]{1,4}:){1,7}:'
+                   r'(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?'
+                   r'|(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}'
+                   r'|::(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?'
+                   r')(?![\w:.])'),
+        '<IP>',
+    ),
+    # 8. IPv4, with an optional port taken in the same match.
+    #
+    #    The port cannot be a separate rule with a (?<=<IP>) lookbehind: by
+    #    the time that rule ran, <IP> would be a protected placeholder and
+    #    excluded from the text the rule is applied to, so the lookbehind
+    #    could never match. Consuming the port here also keeps the port from
+    #    reaching the bare-number rule.
+    (
+        re.compile(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?::(\d{1,5}))?(?![\w.])'),
+        lambda m: '<IP>:<PORT>' if m.group(1) else '<IP>',
+    ),
+    # 9. Dotted host names. Nothing masked these before: scrub() preserves
+    #    hostnames deliberately, and masking never picked up the job, so
+    #    every node's own FQDN minted its own template for what was
+    #    otherwise the same event. Must run after the IPv4 rule (8) so an
+    #    address is already <IP> and cannot be misread as a dotted name --
+    #    though the final label class ([A-Za-z], never a digit) would
+    #    already refuse a numeric IPv4 octet on its own, so this ordering
+    #    is a second line of defence, not the only one. Pattern and the
+    #    file/unit-suffix exclusion in _mask_hostname are ported from the
+    #    server's hostname rule in canonical.go, so the two agree on what
+    #    counts as a host.
+    (
+        re.compile(r'\b(?:[A-Za-z0-9_<][A-Za-z0-9_<>-]*\.)+[A-Za-z][A-Za-z0-9]{1,23}\b'),
+        _mask_hostname,
+    ),
+    # 10. The bracketed SYSLOG_IDENTIFIER the tail query prefixes every line
+    #     with (see `line_format` in Client.tail). NS8 module instances are
+    #     named like "nethvoice84", where the trailing digits are the
+    #     per-install instance number, not signal: across the fleet they
+    #     turn one event into as many templates as there are installs. The
+    #     module type before the digits is the actual signal and is kept
+    #     as-is.
+    #
+    #     `@` and `.` are in the class because an NS8 agent identifies
+    #     itself as `agent@openldap55`, and scrub()'s email rule preserves
+    #     that name deliberately (see its negative lookahead above) so it
+    #     reaches masking intact. What keeps the rule narrow is not the
+    #     class but the anchoring: the digits have to be the last thing
+    #     before the `]`, so `[php7:error]`, `[nextcloud]`,
+    #     `[sshd-session]` and `[systemd-logind]` are all untouched, and
+    #     the rule is idempotent because its own output never ends in a
+    #     digit. Kept character-for-character in step with the identical
+    #     rule in the server's model.CanonicalTemplate.
+    (
+        re.compile(r'\[([A-Za-z][\w@.-]*?)\d+\]'),
+        r'[\1]',
+    ),
+    # 11. PIDs in their three common shapes. Before the bare-number rule.
+    (
+        re.compile(r'\[\d+\]'),
+        '[<PID>]',
+    ),
+    (
+        re.compile(r'(?i)\b(pid)\b([=: ]+)\d+'),
+        r'\1\2<PID>',
+    ),
+    (
+        re.compile(r'\((\d{2,})\)'),
+        '(<PID>)',
+    ),
+    # 12. Hex runs. After UUID and IPv6. Eight is the shortest run that is
+    #     more often a checksum than a word: "cafe" and "deadbeef" both
+    #     exist in prose, but eight-plus hex characters rarely do.
+    (
+        re.compile(r'\b(?=[0-9a-fA-F]*\d)[0-9a-fA-F]{8,}\b'),
+        '<HEX>',
+    ),
+    # 13. Account names in authentication messages, written as "user=name"
+    #     or "username=name" with no separating space. Must run before
+    #     rule 14: for "user  =  alice", rule 14's bare "\s+\S+" would
+    #     otherwise match the whitespace right up to the "=" and leave
+    #     "user <USER>  alice" instead of folding the whole assignment.
+    #
+    #     Measured against six hours of real cluster logs: an SSH
+    #     dictionary attack produced 319 distinct templates that differed
+    #     only by the account being tried. Left unmasked, every window of
+    #     an ongoing attack looks like hundreds of brand-new templates,
+    #     which opens the server's novelty gate forever and defeats the
+    #     cost control it exists to provide. The retained sample line
+    #     still carries the actual account name, and the count carries
+    #     the volume.
+    (
+        re.compile(r'(?i)\b(user(?:name)?)\s*=\s*(?!<)[^\s,;]+'),
+        r'\1=<USER>',
+    ),
+    # 14. The same, written "user name" with whitespace instead of "=". The
+    #     (?!<) guard on both rules is what stops a second mask() pass
+    #     from rewriting <USER> into <<USER>>.
+    (
+        re.compile(r'(?i)\b(user(?:name)?)\s+(?!<)\S+'),
+        r'\1 <USER>',
+    ),
+    # 15. GeoIP country codes written as a field, e.g. "country=US" or
+    #     "country_code: IT". The (?!<) guard does the same job as in
+    #     rules 13 and 14: it is what stops a second mask() pass from
+    #     rewriting <CC> into <<CC>>.
+    (
+        re.compile(r'(?i)\b(country(?:[_-]?code)?)(\s*[=:]\s*|\s+)(?!<)[A-Z]{2}\b'),
+        r'\1\2<CC>',
+    ),
+    # 16. GeoIP country codes as CrowdSec writes them, e.g. "(US/24)" in a
+    #     ban-scenario line. This is the shape the leak was actually
+    #     measured in: one scenario mints a template per country per ban
+    #     duration. No (?!<) guard is needed: the replacement's "(" is
+    #     followed by "<", and "<" can never satisfy the rule's own
+    #     [A-Z]{2}, so a second pass already can't rematch.
+    (
+        re.compile(r'\(([A-Z]{2})/'),
+        r'(<CC>/',
+    ),
+    # 17. Percentages. Before the decimal rule (18) below, or "1.5%" would
+    #     lose its fractional part to <NUM> and leave a stray "%" behind.
+    #     Also before the bare-integer rule (19) below: masking "34" to
+    #     <NUM> first would leave "0.<NUM> s" behind for "0.34 s", and
+    #     <NUM> is a protected placeholder by the time the decimal rule
+    #     ran, so the decimal would never fold. Must still run after the
+    #     IPv4 rule (8) so an address is already <IP> and its octets
+    #     cannot be misread as a decimal or percentage.
+    #
+    #     The server's canonical.go carries a "(?:\d+|<NUM>)" alternative
+    #     in its own percentage and decimal rules, because its integer
+    #     rule already runs first in its pipeline, so some of the digits
+    #     those rules need are already the literal text "<NUM>" by the
+    #     time they run. This collector deliberately runs the percentage
+    #     and decimal rules before the bare-integer rule instead -- that
+    #     is strictly better, because it folds "0.34" whole rather than
+    #     leaving "0.<NUM>" for the server to clean up on receipt -- so
+    #     that alternative is dead here and is dropped; plain \d+ is
+    #     enough.
+    (
+        re.compile(r'\d+(?:\.\d+)?%'),
+        '<PCT>',
+    ),
+    # 18. Decimals not already claimed as a percentage. Same reasoning as
+    #     rule 17 above for why this runs before the bare-integer rule
+    #     (19) and after the IPv4 rule (8): the alternative the server's
+    #     canonical.go needs is dead here for the same reason and is
+    #     likewise dropped.
+    (
+        re.compile(r'\d+\.\d+'),
+        '<NUM>',
+    ),
+    # 19. Bare integers, two digits or more. Left at \d{2,} rather than
+    #     \d+: lone digits are handled separately by rule 20 below, and
+    #     rules 17-18 above have already folded a percentage or a decimal
+    #     whole by the time this runs, so there is nothing left for this
+    #     rule to shred. The (?<![\w<]) / (?![\w>]) guards are what keep a
+    #     priority marker and names like traefik1 intact here; the leading
+    #     priority marker <3> is additionally protected by being split off
+    #     in mask() before any rule runs at all.
+    (
+        re.compile(r'(?<![\w<])\d{2,}(?![\w>])'),
+        '<NUM>',
+    ),
+    # 20. Single digits, last of all so every rule above has already
+    #     claimed the digits it needs. \b never matches inside a word, so
+    #     traefik1 and nethvoice5 are untouched by this rule specifically
+    #     -- rule 10 already renamed the former, and the latter's "5" is
+    #     simply not preceded by a word boundary. The leading priority
+    #     marker is safe because it was split off in mask(), not because
+    #     of anything in this rule.
+    (
+        re.compile(r'\b\d\b'),
+        '<NUM>',
+    ),
+]
+
+# One pass that alternates "an existing placeholder" against "the next rule".
+# Matching placeholders first and re-emitting them unchanged is what stops a
+# second mask() call from rewriting <PID> into <[<PID>]> or <NUM> into <<NUM>>.
+_PROTECTED = re.compile(_PLACEHOLDER)
+
+
+def mask(line):
+    """Return the template form of one already-scrubbed log line.
+
+    A leading "<N>" priority marker, if present, is set aside first (see
+    _split_priority) and restored verbatim, so none of the rules below --
+    in particular rule 20's single-digit rule -- can ever touch it.
+    """
+    prefix, rest = _split_priority(line)
+    for pattern, replacement in MASKING_RULES:
+        rest = _mask_apply(pattern, replacement, rest)
+    return prefix + rest
+
+
+def _mask_apply(pattern, replacement, line):
+    """Apply one rule to the parts of `line` that are not already placeholders."""
+    out = []
+    position = 0
+    for protected in _PROTECTED.finditer(line):
+        out.append(pattern.sub(replacement, line[position:protected.start()]))
+        out.append(protected.group(0))
+        position = protected.end()
+    out.append(pattern.sub(replacement, line[position:]))
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------
+# Module families.
+#
+# An NS8 module instance id is the image name followed by an instance
+# number, so nethvoice5 and nethvoice39 are two installs of ONE module,
+# running the same image, the same version and the same code path. Templates
+# are collected per family for that reason -- see flush() below.
+# --------------------------------------------------------------------------
+
+def module_family(module_id):
+    """Reduce an NS8 module instance id to the module it is an instance of.
+
+    nethvoice5 and nethvoice39 are both nethvoice; nethvoice-proxy4 is
+    nethvoice-proxy. An instance id is the image name followed by a
+    sequence number, so this is a naming convention rather than a
+    heuristic.
+
+    The empty module id -- HOST_BUCKET, which carries sshd, systemd and
+    runagent -- maps to itself and stays an ordinary bucket.
+
+    The result never ends in a digit, so this is idempotent: a family may
+    be handed back in where an instance id is expected without changing.
+
+    Deliberately the same rule as model.ModuleFamily in the server, which
+    keys novelty, the system_templates row and prompt grouping on it. The
+    two must agree: if the collector shipped a family the server would not
+    derive, a template the store already knew would read as novel.
+
+    The one shape this gets wrong is a module whose image name genuinely
+    ends in a digit, which would merge with a differently-numbered
+    sibling. No NS8 module on the dev fleet does, and both would have to
+    be installed on the same node for it to matter.
+    """
+    family = module_id.rstrip("0123456789")
+    if not family:
+        return module_id
+    return family
+
+
+# --------------------------------------------------------------------------
+# Line-budget allocation: divide the line budget between modules, fairly.
+# --------------------------------------------------------------------------
+
+# Every module family is guaranteed this many lines before any weighting
+# applies. This is what actually fixes starvation: a crash-looping module
+# can no longer consume the whole budget, because every other module's
+# floor is reserved first.
+#
+# The floor is only reachable if the caller hands allocate() families
+# rather than instances. On a hosting node with 185 instances across 16
+# families, 185 * 20 is already past DEFAULT_MAX_LINES, so the degrade
+# path below would give every bucket 500 // 185 = 2 lines -- including the
+# host bucket, which carries the majority of security-relevant traffic. At
+# 16 families, 16 * 20 = 320 < 500 and the floor holds.
+MIN_SHARE = 20
+
+# Deviating or security-carrying modules get this much of the remainder
+# relative to a quiet one.
+PRIORITY_WEIGHT = 3.0
+
+
+def allocate(buckets, max_lines, prioritised=()):
+    """Return {bucket: share}. The total never exceeds max_lines.
+
+    `buckets` are module families as flush() calls this (see MIN_SHARE
+    above for why families rather than instances), but the arithmetic here
+    is agnostic: it divides a budget between whatever keys it is handed.
+    """
+    modules = list(buckets)
+    if not modules:
+        return {}
+
+    count = len(modules)
+    if count * MIN_SHARE >= max_lines:
+        # More modules than floor space. Equal shares, floor unreachable.
+        share = max(1, max_lines // count)
+        return {m: share for m in modules}
+
+    prioritised = set(prioritised)
+    weights = {m: (PRIORITY_WEIGHT if m in prioritised else 1.0) for m in modules}
+    total_weight = sum(weights.values())
+    remainder = max_lines - count * MIN_SHARE
+
+    return {m: MIN_SHARE + int(remainder * weights[m] / total_weight)
+            for m in modules}
+
+
+# --------------------------------------------------------------------------
+# Loki HTTP client.
+#
+# Everything goes over the HTTP API. logcli is deliberately not used: the
+# tail loop issues a query every TICK_SECONDS for the life of the daemon,
+# and a subprocess spawn per tick is both slower and harder to diagnose
+# than a status code. The two sibling forwarders in this directory do shell
+# out to logcli; this file follows their loop shape, not their transport.
+# --------------------------------------------------------------------------
+
+LOKI_TIMEOUT = 60
+
+# Host-level journal records (sshd, systemd, runagent) carry no module_id
+# label at all, so the label-values endpoint never lists them. They are
+# collected under this synthetic bucket instead. Measured on a live cluster,
+# these lines are the majority of security-relevant traffic, so dropping them
+# would defeat the point of the collector.
+HOST_BUCKET = ""
+
+
+def _filter_stages(denylist, self_identifier, include_message=False):
+    """Population-filtering LogQL stages shared by Client.digest and lines.
+
+    digest()'s observed/expected counts feed prioritisation and the
+    server's deviation gate; tail() is what the prompt's templates are
+    actually built from. An unfiltered digest would describe a population
+    the prompt never shows, and the gate could then fire on lines the
+    model never saw. Building both queries' filter stages from this one
+    function is what keeps the two from drifting apart again as either
+    query changes -- only the selector and (for tail()) the trailing
+    line_format stage differ between the two callers.
+
+    digest() now runs only as the flat baseline fallback, so the population
+    it has to agree with is the one TemplateStore counts as it folds the
+    tail. That is why these stages still have exactly one definition.
+    """
+    fields = 'priority="PRIORITY", identifier="SYSLOG_IDENTIFIER"'
+    if include_message:
+        fields += ', message="MESSAGE"'
+    stages = [
+        '| json {0}'.format(fields),
+        '| identifier != "{0}"'.format(self_identifier),
+        '| priority < 5 or category="security"',
+    ]
+    if denylist:
+        stages.append('!~ "{0}"'.format("|".join(denylist)))
+    return stages
+
+
+class LokiError(RuntimeError):
+    pass
+
+
+class Client:
+    def __init__(self, base_url, username, password, timeout=LOKI_TIMEOUT):
+        self._base = base_url.rstrip("/")
+        self._auth = base64.b64encode(
+            "{0}:{1}".format(username, password).encode()).decode()
+        self._timeout = timeout
+
+    def _get(self, path, params):
+        url = "{0}{1}?{2}".format(self._base, path, urllib.parse.urlencode(params))
+        request = urllib.request.Request(url)
+        request.add_header("Authorization", "Basic " + self._auth)
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")[:500]
+            raise LokiError("{0} {1}: {2}".format(path, exc.code, body)) from exc
+        except urllib.error.URLError as exc:
+            raise LokiError("{0}: {1}".format(path, exc.reason)) from exc
+        except TimeoutError as exc:
+            # A hang after the request is fully sent surfaces here, not as
+            # URLError: urllib only wraps send-phase failures, not
+            # response-read timeouts on an already-open connection.
+            raise LokiError("{0}: timed out waiting for a response".format(path)) from exc
+
+    @staticmethod
+    def _ns(when):
+        return str(int(when.timestamp() * 1e9))
+
+    def digest(self, at, range_seconds, denylist, self_identifier):
+        """{(module_id, priority): count} over the range ending at `at`.
+
+        Filtered by the same stages as tail() (see _filter_stages): an
+        unfiltered aggregation would describe a population the prompt's
+        templates never show, letting the server's deviation gate fire on
+        lines the model never saw. Returns {} on failure. A busy cluster
+        can exceed max_query_series on this aggregation, and losing the
+        digest costs prioritisation and the `expected` field, not the run.
+        """
+        stages = _filter_stages(denylist, self_identifier)
+        query = ('sum by (module_id, priority) (count_over_time('
+                 '{{node_id=~".+"}} {0} [{1}s]))'
+                 ).format(" ".join(stages), int(range_seconds))
+        try:
+            payload = self._get("/loki/api/v1/query",
+                                {"query": query, "time": at.isoformat()})
+        except LokiError:
+            return {}
+        out = {}
+        for series in (payload.get("data") or {}).get("result") or []:
+            labels = series.get("metric") or {}
+            try:
+                priority = int(labels.get("priority", -1))
+                value = float(series["value"][1])
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+            out[(labels.get("module_id", HOST_BUCKET), priority)] = value
+        return out
+
+    def baseline_series(self, at, range_seconds, step_seconds, denylist,
+                        self_identifier):
+        """{(module_id, priority): [(ts_seconds, value), ...]} over the
+        `range_seconds` baseline period ending at `at`, in non-overlapping
+        `step_seconds`-wide buckets.
+
+        Same aggregation and the same _filter_stages(...) as digest() --
+        reused, not rebuilt, so the two populations cannot drift apart --
+        but run over /query_range instead of the instant /query endpoint,
+        with count_over_time's range and the request's step both set to
+        `step_seconds` so the buckets tile the period exactly once, with
+        no overlap and no gap, ready for seasonal_baseline() to bucket by
+        hour-of-week.
+
+        This is a heavier query than the instant one digest() runs:
+        query_range evaluates the aggregation once per step across the
+        whole range instead of once at a single instant, so on a busy
+        cluster it is more likely to time out or exceed max_query_series.
+        Returns {} on failure, same contract as digest(): losing this
+        baseline must cost seasonality (flush() falls back to the flat
+        one), not the run.
+        """
+        stages = _filter_stages(denylist, self_identifier)
+        query = ('sum by (module_id, priority) (count_over_time('
+                 '{{node_id=~".+"}} {0} [{1}s]))'
+                 ).format(" ".join(stages), int(step_seconds))
+        start = at - datetime.timedelta(seconds=range_seconds)
+        try:
+            payload = self._get("/loki/api/v1/query_range", {
+                "query": query,
+                "start": self._ns(start), "end": self._ns(at),
+                "step": str(int(step_seconds)),
+            })
+        except LokiError:
+            return {}
+        out = {}
+        for series in (payload.get("data") or {}).get("result") or []:
+            labels = series.get("metric") or {}
+            try:
+                priority = int(labels.get("priority", -1))
+            except (TypeError, ValueError):
+                continue
+            key = (labels.get("module_id", HOST_BUCKET), priority)
+            values = []
+            for pair in series.get("values") or []:
+                try:
+                    ts = int(float(pair[0]))
+                    value = float(pair[1])
+                except (IndexError, TypeError, ValueError):
+                    continue
+                values.append((ts, value))
+            if values:
+                out[key] = values
+        return out
+
+    def tail(self, since_ns, until_ns, denylist, self_identifier,
+             limit=TAIL_LIMIT):
+        """One forward page of collectable lines in [since_ns, until_ns).
+
+        Returns a list of (ts_ns, text, module_id, category), oldest first,
+        at most `limit` long. A page exactly `limit` long means Loki had
+        more to give -- see drain_range, which keeps reading.
+
+        ONE query covers every module and the host bucket, because the
+        selector carries no module matcher. That is the whole point of
+        following the stream instead of re-querying a closed window: the
+        old per-family fetch cost one or two query_range calls per family
+        per window, and the collector had to ask Loki to hand back lines it
+        could have folded as they arrived.
+
+        Timestamps are nanoseconds, not datetimes, so the caller's cursor
+        can sit exactly one nanosecond past the last line it consumed. Loki
+        treats `start` as inclusive and `end` as exclusive, so a cursor
+        parked on `until_ns` re-reads nothing and skips nothing.
+
+        Host-level records (sshd, systemd, runagent) carry no module_id
+        label at all and fall through to HOST_BUCKET, the same synthetic
+        bucket the rest of the collector already uses for them.
+        """
+        stages = ['{node_id=~".+"}'] + _filter_stages(
+            denylist, self_identifier, include_message=True)
+        stages.append(
+            '| line_format "<{{.priority}}> [{{.identifier}}] {{.message}}"')
+        payload = self._get("/loki/api/v1/query_range", {
+            "query": " ".join(stages),
+            "start": str(int(since_ns)), "end": str(int(until_ns)),
+            "limit": str(int(limit)), "direction": "forward",
+        })
+        # module_id and category are stream labels, not line fields, so both
+        # are read per series rather than parsed back out of the rendered
+        # line. Losing category would make the server's security gate
+        # condition unreachable.
+        out = []
+        for series in (payload.get("data") or {}).get("result") or []:
+            labels = series.get("stream") or {}
+            module_id = labels.get("module_id", HOST_BUCKET)
+            category = labels.get("category", "")
+            for timestamp, text in series.get("values") or []:
+                out.append((int(timestamp), text, module_id, category))
+        out.sort()
+        return out
+
+
+# --------------------------------------------------------------------------
+# Seasonal baseline: bucket baseline_series() samples by hour-of-week, so a
+# bucket with a business-hours or nightly-backup shape is compared against
+# its own kind of hour instead of a flat week-long average that shape would
+# always exceed on schedule.
+# --------------------------------------------------------------------------
+
+# With step_seconds equal to the 15-minute collection window and a 168-hour
+# baseline, each hour-of-week bucket collects BASELINE_HOURS * 3600 /
+# step_seconds / 168 = 3600 / 900 = 4 samples. Three is the most that can be
+# demanded while still tolerating one missing sample out of those four.
+MIN_BASELINE_SAMPLES = 3
+
+
+def _hour_of_week(ts_seconds):
+    """UTC hour-of-week, 0-167, Monday 00:00 = 0, for a unix timestamp.
+
+    Its own function so a test can exercise the bucketing rule directly,
+    independent of seasonal_baseline()'s aggregation.
+    """
+    when = datetime.datetime.fromtimestamp(ts_seconds, datetime.timezone.utc)
+    return when.weekday() * 24 + when.hour
+
+
+def seasonal_baseline(series, target_start, minimum_samples=MIN_BASELINE_SAMPLES):
+    """{(module_id, priority): (expected, stddev, sample_count, seasonal)}
+
+    Pure and I/O-free -- `series` is whatever Client.baseline_series
+    returned, `target_start` is the collection window's start -- so it is
+    unit-testable without a Loki client.
+
+    Every sample is bucketed by its own hour-of-week (_hour_of_week). The
+    target bucket is target_start's own hour-of-week. When that bucket
+    already holds at least `minimum_samples` samples, `expected` and
+    `stddev` are that bucket's mean and population standard deviation, and
+    `seasonal` is True. Otherwise there is not yet enough history for that
+    hour of the week -- a node less than a week old, most commonly -- so
+    this falls back to the mean and population standard deviation over
+    ALL samples in the series, with `seasonal` False: the flat behaviour
+    this feature replaces, so a partial week degrades to the old baseline
+    rather than to no baseline at all.
+    """
+    target_bucket = _hour_of_week(target_start.timestamp())
+    out = {}
+    for key, samples in series.items():
+        if not samples:
+            continue
+        by_bucket = collections.defaultdict(list)
+        for ts, value in samples:
+            by_bucket[_hour_of_week(ts)].append(value)
+        target_values = by_bucket.get(target_bucket, [])
+        if len(target_values) >= minimum_samples:
+            values, seasonal = target_values, True
+        else:
+            values = [value for _, value in samples]
+            seasonal = False
+        # statistics.pstdev of a single-element list is correctly 0.0, not
+        # an error, so no extra guard is needed beyond `values` being
+        # non-empty -- guaranteed by the `if not samples: continue` above.
+        expected = statistics.fmean(values)
+        stddev = statistics.pstdev(values)
+        out[key] = (expected, stddev, len(values), seasonal)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Bundle assembly: turn collected lines into the wire payload.
+# --------------------------------------------------------------------------
+
+# Bumped whenever a digest row's shape changes, so a receiving server knows
+# which fields to expect. The deployed server still only accepts 1: the new
+# fields (expected_stddev, baseline_samples, baseline_seasonal, variants) are
+# additive and the server ignores unknown JSON fields, so this stays at 1
+# until the server explicitly opts in to a 2 it understands.
+SCHEMA_VERSION = 1
+
+# The identifier is carried in the rendered line; the priority prefix is
+# parsed back out so templates can be grouped by it.
+PRIORITY_RE = re.compile(r'^<(\d+)>')
+
+# Drain-style clustering match-ratio threshold: the fraction of token
+# positions that must still agree for a template to join an existing
+# cluster rather than start a new one. Measured on 710 live templates from
+# three rl1 dev-fleet nodes (2026-09-01): a Drain-style pass at this
+# threshold collapsed them to 249 distinct shapes (35%), with 512 of the
+# 710 landing in a multi-member cluster -- metrics1 alone contributed 223
+# templates describing 5 conditions. At 0.5, Prometheus's `msg="Deleting
+# obsolete block"` and `msg="write block"` lines -- which share their `<3>
+# [prometheus] ... msg="..."` scaffolding but differ across enough of the
+# remaining positions -- land in two separate clusters, each keeping its
+# own literal msg= text, while positional variants of the *same* message
+# (a changed component= or a changed block id) still fold into one.
+# Raising the threshold leaves more near-duplicates uncollapsed; lowering
+# it starts merging distinct conditions like the two above into one.
+CLUSTER_SIMILARITY = 0.5
+
+
+def cluster_templates(entries):
+    """Fold near-duplicate template entries into one wildcarded shape each.
+
+    Pure and I/O-free -- no client, no I/O -- so it is unit-testable on its
+    own. `entries` is a list of the dicts TemplateStore builds
+    (template, count, module_id, priority, category, first_seen, last_seen,
+    samples); the return is a new list of the same shape, with a
+    `variants` key added -- only when it is greater than 1 -- holding how
+    many raw templates folded into that entry, so an uncollapsed entry
+    stays as lean as it was before and a reader can treat an absent
+    `variants` as 1.
+
+    flush() calls this once per module FAMILY, so module_id is
+    already constant across `entries` here and is deliberately left out of
+    the bucket key below -- adding it back would be a redundant
+    comparison. Family scope is also what makes this pass worth running at
+    all: called per instance, the 82 byte-identical
+    `pam_unix(cron:session)` templates of 82 nethvoice instances each
+    formed a cluster of one and all 82 shipped. A family-keyed bucket key
+    would be the alternative if the caller ever went back to per-instance
+    -- a global pass would let [nethvoice] and [openldap] lines with the
+    same token count merge on a 0.5 match ratio.
+
+    Bucketing: two entries are only ever compared when they agree on
+    priority, category and token count (len(template.split())) -- a
+    wildcarded pattern never changes length, so a mismatched token count
+    could never match regardless of content.
+
+    Within a bucket this is a greedy Drain-style assignment. Entries are
+    processed in a deterministic (-count, template) order first, so the
+    same input always produces the same clusters regardless of arrival
+    order -- without that, the shapes shipped would drift window to
+    window even when the underlying events do not, which would mint a
+    fresh "novel" template every run and defeat the whole point of
+    clustering. Each entry is compared position-by-position against every
+    existing cluster's current pattern: a position counts as matching only
+    when the cluster still holds literal text there AND that text equals
+    the entry's token; a position where the cluster already holds <*>
+    counts as NOT matching, which is what stops a cluster from widening
+    until it silently absorbs everything. The entry joins the first
+    cluster whose match ratio reaches CLUSTER_SIMILARITY; otherwise it
+    seeds a new cluster of its own.
+    """
+    buckets = collections.OrderedDict()
+    for entry in entries:
+        tokens = entry["template"].split()
+        key = (entry["priority"], entry["category"], len(tokens))
+        buckets.setdefault(key, []).append((entry, tokens))
+
+    out = []
+    for bucket in buckets.values():
+        bucket.sort(key=lambda pair: (-pair[0]["count"], pair[0]["template"]))
+        clusters = []
+        for entry, tokens in bucket:
+            target = None
+            # An empty template has no positions to compare, so it could
+            # never reach the threshold anyway: skipping the search is
+            # what keeps the ratio below from dividing by zero. Neither
+            # line_format nor sanitize_line() can produce one today, but
+            # the cost of being wrong about that is the whole window.
+            for cluster in (clusters if tokens else ()):
+                pattern = cluster["tokens"]
+                matches = sum(
+                    1 for i in range(len(tokens))
+                    if pattern[i] != '<*>' and pattern[i] == tokens[i]
+                )
+                if matches / len(tokens) >= CLUSTER_SIMILARITY:
+                    target = cluster
+                    break
+
+            if target is None:
+                clusters.append({
+                    "tokens": list(tokens),
+                    "variants": 1,
+                    "merged": {
+                        "template": entry["template"],
+                        "count": entry["count"],
+                        "module_id": entry["module_id"],
+                        "priority": entry["priority"],
+                        "category": entry["category"],
+                        "first_seen": entry["first_seen"],
+                        "last_seen": entry["last_seen"],
+                        "samples": list(entry["samples"]),
+                    },
+                })
+                continue
+
+            pattern = target["tokens"]
+            # Position 0 is the "<N>" priority marker line_format adds, and
+            # it is already part of the bucket key above, so it always
+            # matches here regardless. Excluded from the loop explicitly
+            # (range starts at 1) rather than relying on that -- belt and
+            # braces, so a future change to the bucket key could not
+            # silently start wildcarding it.
+            for i in range(1, len(tokens)):
+                if pattern[i] != tokens[i]:
+                    pattern[i] = '<*>'
+            merged = target["merged"]
+            merged["count"] += entry["count"]
+            merged["first_seen"] = min(merged["first_seen"], entry["first_seen"])
+            merged["last_seen"] = max(merged["last_seen"], entry["last_seen"])
+            # Same first-then-overwrite-last convention TemplateStore
+            # uses for duplicate raw lines, one level up: keep the first
+            # sample seen, and let the most recently merged entry's own
+            # last sample keep overwriting the second slot.
+            if len(merged["samples"]) == 1:
+                merged["samples"].append(entry["samples"][-1])
+            else:
+                merged["samples"][1] = entry["samples"][-1]
+            target["variants"] += 1
+
+        for cluster in clusters:
+            merged = cluster["merged"]
+            merged["template"] = " ".join(cluster["tokens"])
+            if cluster["variants"] > 1:
+                merged["variants"] = cluster["variants"]
+            out.append(merged)
+    return out
+
+
+# --------------------------------------------------------------------------
+# The bounded template store.
+#
+# The collector follows the log stream continuously, so the aggregate it
+# builds between two bundles is the only thing in the process that grows
+# with traffic. It is therefore capped: a fixed number of distinct
+# templates, each holding at most two length-capped samples.
+#
+# Eviction is LRU on last-seen. A template that keeps recurring keeps
+# getting refreshed; the one discarded under pressure is the one nothing
+# has matched for longest. Note this is deliberately NOT least-frequently
+# used: a rare template is exactly the novel one the server's gate exists
+# to notice, while the frequent ones are the noise DENYLIST already
+# targets.
+#
+# Eviction only ever costs templates. observed[] is a plain counter and is
+# never evicted, so a line whose template was dropped is still counted, and
+# the digest the server's deviation gate reads stays complete.
+# --------------------------------------------------------------------------
+
+# Roughly 6 MB at SAMPLE_MAX_CHARS; the unit caps the process at 256M.
+MAX_TEMPLATES = 5000
+
+# A journal line has no inherent length limit, and every entry holds two of
+# them, so capping the entry count alone would not actually bound memory.
+SAMPLE_MAX_CHARS = 512
+
+
+class TemplateStore:
+    """Fold a stream of log lines into counted, capped templates.
+
+    This is the old group_templates() turned inside out: same masking, same
+    (template, priority, category) dedup and same first-and-last sample
+    convention, but folding one line at a time as it arrives instead of one
+    list at the end of a window.
+
+    Entries are keyed on the module FAMILY rather than the instance, so two
+    instances of one module running the same image and the same code path
+    collapse into one template -- per instance they could not meet, and 82
+    nethvoice instances shipped 82 byte-identical pam_unix templates. The
+    family is part of the key and not merely a field on the entry: two
+    DIFFERENT families that happen to mask to the same text are two
+    templates, exactly as the old per-family grouping made them.
+
+    observed[] stays keyed on the INSTANCE on purpose: the server's
+    module_baselines and its deviation gate are per-instance, so that one
+    instance flooding is still visible instead of averaged out across its
+    siblings.
+
+    Counting here rather than in a separate Loki aggregation is what makes
+    the counted population and the templated population the same population
+    by construction. They used to be two queries that had to be kept in
+    step by hand, and the server's gate fired on lines the model never saw
+    when they drifted.
+    """
+
+    def __init__(self, max_templates=MAX_TEMPLATES):
+        self._max = max_templates
+        # Insertion/refresh ordered: the front is the coldest entry.
+        self._entries = collections.OrderedDict()
+        self.observed = collections.Counter()
+        self.lines_seen = 0
+        self.evicted = 0
+
+    def ingest(self, ts_ms, raw, module_id, category):
+        clean = sanitize_line(raw)
+        template = mask(clean)
+        match = PRIORITY_RE.match(clean)
+        priority = int(match.group(1)) if match else 6
+
+        self.observed[(module_id, priority)] += 1
+        self.lines_seen += 1
+
+        sample = clean[:SAMPLE_MAX_CHARS]
+        key = (module_family(module_id), template, priority, category)
+        entry = self._entries.get(key)
+        if entry is None:
+            self._entries[key] = {
+                "template": template, "count": 1,
+                "module_id": key[0], "priority": priority,
+                "category": category,
+                "first_seen": ts_ms, "last_seen": ts_ms,
+                "samples": [sample],
+            }
+            while len(self._entries) > self._max:
+                self._entries.popitem(last=False)
+                self.evicted += 1
+            return
+
+        entry["count"] += 1
+        entry["first_seen"] = min(entry["first_seen"], ts_ms)
+        entry["last_seen"] = max(entry["last_seen"], ts_ms)
+        # Keep the first and last raw line only; the server caps at 2.
+        if len(entry["samples"]) == 1:
+            entry["samples"].append(sample)
+        else:
+            entry["samples"][1] = sample
+        self._entries.move_to_end(key)
+
+    def drain(self):
+        """Hand over the window's aggregate and reset for the next one.
+
+        Returns (entries, observed, lines_seen, evicted). The caller owns
+        the returned objects; the store keeps none of them. The cursor is
+        deliberately not part of this -- it belongs to the tail loop and
+        survives a flush.
+        """
+        entries = list(self._entries.values())
+        observed, seen, evicted = self.observed, self.lines_seen, self.evicted
+        self._entries = collections.OrderedDict()
+        self.observed = collections.Counter()
+        self.lines_seen = 0
+        self.evicted = 0
+        return entries, observed, seen, evicted
+
+
+def build_bundle(system_id, collector_version, window, digest_rows, templates, budget):
+    """Assemble the wire payload."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "system_id": system_id,
+        "collector_version": collector_version,
+        "masking_version": MASKING_VERSION,
+        "window": {"start": window[0], "end": window[1]},
+        "digest": digest_rows,
+        "templates": templates,
+        "budget": budget,
+    }
+
+
+# --------------------------------------------------------------------------
+# The collector itself.
+# --------------------------------------------------------------------------
+
+def read_identity():
+    """(system_id, secret) from the cluster subscription, or (None, None).
+
+    Identity is not module configuration: it is the node's existing
+    NethServer subscription, so a configured collector cannot be pointed at
+    a different tenant by editing module state.
+    """
+    import agent  # deferred: unavailable in the unit-test container
+
+    raw = agent.redis_connect().hgetall("cluster/subscription")
+    fields = {}
+    for key, value in raw.items():
+        if isinstance(key, bytes):
+            key = key.decode()
+        if isinstance(value, bytes):
+            value = value.decode()
+        fields[key] = value
+
+    system_id = fields.get(SUBSCRIPTION_ID_FIELD) or None
+    secret = None
+    for name in SUBSCRIPTION_SECRET_FIELDS:
+        value = fields.get(name)
+        if value:
+            secret = value
+            break
+
+    if not system_id or not secret:
+        print("cluster/subscription is missing required fields; present: {0}".format(
+            sorted(fields.keys())), file=sys.stderr)
+        return None, None
+
+    return system_id, secret
+
+
+def compute_window(now, minutes=WINDOW_MINUTES):
+    end = now.replace(second=0, microsecond=0)
+    end -= datetime.timedelta(minutes=end.minute % minutes)
+    return end - datetime.timedelta(minutes=minutes), end
+
+
+def ms(when):
+    return int(when.timestamp() * 1000)
+
+
+def ns(when):
+    return int(when.timestamp() * 1e9)
+
+
+def ns_to_datetime(value):
+    return datetime.datetime.fromtimestamp(value / 1e9, datetime.timezone.utc)
+
+
+def read_cursor():
+    """The persisted tail cursor in nanoseconds, or None to start from now.
+
+    A missing file is the normal first-start case and says nothing. Anything
+    else -- unreadable, truncated, not a number -- is reported and then
+    treated the same way: a bad cursor must cost the gap it describes, never
+    the daemon.
+    """
+    try:
+        with open(STREAM_CURSOR_FILE) as cursor_file:
+            return int(cursor_file.read().strip())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        print("{0} unusable ({1}); tailing from now".format(
+            STREAM_CURSOR_FILE, exc), file=sys.stderr)
+        return None
+
+
+def write_cursor(value):
+    try:
+        with open(STREAM_CURSOR_FILE, "w") as cursor_file:
+            cursor_file.write(str(int(value)))
+    except OSError as exc:
+        print("could not write {0}: {1}".format(STREAM_CURSOR_FILE, exc),
+              file=sys.stderr)
+
+
+def row_deviates(row):
+    """True when one assembled digest row deviates enough to matter.
+
+    Shared by flush() (which modules get prioritised for line budget)
+    and is_quiet() (whether the window is worth shipping at all), both
+    reading the same assembled bundle. Defined once and called from both
+    so they cannot drift apart -- two separate copies of this test could
+    disagree, and a window could then be judged quiet while one of its
+    own rows was simultaneously prioritised as deviating.
+
+    A row deviates when `expected` is present and greater than zero, the
+    observed/expected ratio exceeds DEVIATION_TOLERANCE, and -- when the
+    row carries an `expected_stddev` greater than zero -- observed also
+    clears expected by DEVIATION_SIGMA standard deviations (see
+    DEVIATION_SIGMA above for why the ratio alone is not enough). A row
+    with no dispersion estimate falls back to the ratio alone, so a
+    baseline-query failure cannot silently disable the check.
+    """
+    expected = row.get("expected", 0)
+    if not expected or expected <= 0:
+        return False
+    if row["observed"] / expected <= DEVIATION_TOLERANCE:
+        return False
+    stddev = row.get("expected_stddev", 0)
+    if stddev and stddev > 0:
+        return row["observed"] > expected + DEVIATION_SIGMA * stddev
+    return True
+
+
+def drain_range(client, store, since_ns, until_ns, self_identifier,
+                stop=None):
+    """Ingest every collectable line in [since_ns, until_ns) into `store`.
+
+    Returns the nanosecond cursor to resume from, or raises LokiError. On a
+    failure the caller must leave its own cursor where it was: re-reading a
+    range costs duplicate counts inside one window, whereas skipping one
+    punches a hole nothing can fill later, because the cursor only moves
+    forward.
+
+    Pages until Loki returns a short page. That inner loop is not an
+    optimisation: a tick that finds more than TAIL_LIMIT lines waiting would
+    otherwise advance by one page per TICK_SECONDS and fall permanently
+    behind on a busy node.
+    """
+    cursor = since_ns
+    while cursor < until_ns:
+        if stop is not None and stop["flag"]:
+            return cursor
+        rows = client.tail(cursor, until_ns, DENYLIST, self_identifier)
+        for timestamp, text, module_id, category in rows:
+            store.ingest(timestamp // 1000000, text, module_id, category)
+        if len(rows) < TAIL_LIMIT:
+            break
+        # A full page ends wherever it ends; resume one nanosecond past its
+        # last line so the next page neither repeats nor skips it.
+        cursor = rows[-1][0] + 1
+    return until_ns
+
+
+def flush(client, store, window, max_lines, self_identifier, system_id,
+          minutes=WINDOW_MINUTES):
+    """Turn what the store has accumulated into a bundle, and reset it.
+
+    The store is drained first and unconditionally: whatever happens below,
+    this window's aggregate must not carry into the next one.
+
+    The baseline is the only thing still read from Loki here, and both the
+    calls that fetch it swallow their own LokiError and return {} -- losing
+    a baseline costs the `expected` field, not the bundle. So this does not
+    raise, which is what lets the daemon drain unconditionally.
+    """
+    start, end = window
+    entries, observed, lines_seen, evicted = store.drain()
+    window_seconds = (end - start).total_seconds()
+
+    # Seasonal baseline, bucketed by hour-of-week (seasonal_baseline): a
+    # flat 168-hour mean fires the deviation gate on any bucket with a
+    # business-hours or nightly-backup shape, because that shape exceeds
+    # 3x its own week-long average on schedule, every day, by design.
+    #
+    # The step is the NOMINAL window (--minutes) rather than this window's
+    # actual length. The two agree for every window the boundary logic
+    # produces; they differ only for the partial one the tail loop opens on
+    # a start or a restart, where the cursor decides the start. Sizing the
+    # step off that partial length would shift the baseline buckets for one
+    # bundle, and MIN_BASELINE_SAMPLES' arithmetic is sized against a stable
+    # step. A seasonal `expected` therefore needs no rescaling -- unlike the
+    # flat fallback below -- but it does have to track --minutes: a step
+    # left at 15 minutes while the window is 5 would report an `expected`
+    # three times the population `observed` counts, and the deviation gate
+    # would quietly stop firing.
+    step_seconds = minutes * 60
+    series = client.baseline_series(end, BASELINE_HOURS * 3600, step_seconds,
+                                    DENYLIST, self_identifier)
+    seasonal = seasonal_baseline(series, start) if series else {}
+
+    # baseline_series() is the heavier query and can time out or exceed a
+    # limit where the cheap flat digest() still succeeds. Falling back to
+    # the old flat arithmetic here -- scaled, unlike the seasonal path
+    # above -- is what keeps a node whose baseline query is too heavy on
+    # today's behaviour instead of losing `expected` entirely. This is the
+    # only surviving caller of digest(), and the reason it still exists.
+    baseline = {}
+    if not series:
+        baseline = client.digest(end, BASELINE_HOURS * 3600, DENYLIST,
+                                 self_identifier)
+
+    # Digest rows, and the set of module INSTANCES that deviate from
+    # baseline. Unlike templates[], digest[] stays keyed on the instance on
+    # purpose: the server's module_baselines and its deviation gate are
+    # per-instance so that one instance flooding is still visible instead
+    # of averaged out across its siblings.
+    digest_rows, deviating = [], set()
+    for (module_id, priority), count in sorted(observed.items()):
+        row = {"module_id": module_id, "priority": priority,
+               "observed": int(count)}
+        key = (module_id, priority)
+        if key in seasonal:
+            expected, stddev, sample_count, is_seasonal = seasonal[key]
+            if expected > 0:
+                row["expected"] = round(expected, 3)
+                row["expected_stddev"] = round(stddev, 3)
+                row["baseline_samples"] = sample_count
+                row["baseline_seasonal"] = is_seasonal
+        else:
+            base = baseline.get(key)
+            if base:
+                expected = base / BASELINE_HOURS * (window_seconds / 3600.0)
+                if expected > 0:
+                    row["expected"] = round(expected, 3)
+        if row_deviates(row):
+            deviating.add(module_id)
+        digest_rows.append(row)
+
+    # Templates are already keyed on the family by TemplateStore, so this
+    # only has to bucket them. The budget is divided between the families
+    # that actually have templates to spend it on: a family whose entries
+    # were all evicted cannot use a share, and handing it one would only
+    # shrink everybody else's. Its lines are still counted in digest[].
+    by_family = collections.OrderedDict()
+    for entry in entries:
+        by_family.setdefault(entry["module_id"], []).append(entry)
+    families = sorted(by_family)
+
+    # The weighting input is folded to families the same way the buckets
+    # are, or a deviating instance would weight a key allocate() never
+    # sees.
+    shares = allocate(
+        families, max_lines,
+        prioritised={module_family(module_id) for module_id in deviating})
+
+    templates, truncated = [], []
+    lines_kept = 0
+    for family in families:
+        family_entries = by_family[family]
+        share = shares.get(family, MIN_SHARE)
+
+        # Cluster before the sort-and-truncate-to-share step below:
+        # clustering first means the family's budget buys distinct *shapes*
+        # rather than near-duplicate spellings of one shape -- capping first
+        # would let a handful of near-duplicate templates crowd out a
+        # genuinely distinct one before clustering ever got a chance to
+        # collapse them.
+        clustered = cluster_templates(family_entries)
+        ordered = sorted(clustered, key=lambda t: (-t["count"], t["template"]))
+        kept = ordered[:share]
+        for entry in kept:
+            if not entry.get("category"):
+                entry.pop("category", None)
+
+        family_kept = sum(entry["count"] for entry in kept)
+        templates.extend(kept)
+        lines_kept += family_kept
+
+        if len(ordered) > share:
+            # Exact now, not estimated: observed[] and the templates are
+            # two tallies of the same stream, so there is no digest outage
+            # that can leave the two describing different populations.
+            family_observed = sum(
+                count for (module_id, _p), count in observed.items()
+                if module_family(module_id) == family)
+            truncated.append({
+                "module_id": family,
+                "dropped": max(0, family_observed - family_kept),
+                "truncated": True,
+            })
+
+    budget = {"max_lines": max_lines, "lines_seen": lines_seen,
+              "lines_kept": lines_kept}
+    if truncated:
+        budget["truncated_modules"] = truncated
+    if evicted:
+        # An LRU quietly discarding shapes is otherwise invisible both to
+        # the server and to whoever has to decide whether MAX_TEMPLATES is
+        # still the right number.
+        budget["templates_evicted"] = evicted
+
+    return build_bundle(
+        system_id,
+        COLLECTOR_VERSION, (ms(start), ms(end)), digest_rows, templates, budget)
+
+
+def collect_window(client, window, max_lines, self_identifier, system_id,
+                   minutes=WINDOW_MINUTES):
+    """One closed window, start to finish: the one-shot path.
+
+    Exactly the daemon's two steps -- drain_range fills a store, flush turns
+    it into a bundle -- over a bounded range instead of a moving one, so a
+    manual run and the daemon cannot diverge. Reads and writes no cursor: a
+    one-shot must not move the daemon's resume point.
+    """
+    start, end = window
+    store = TemplateStore()
+    drain_range(client, store, ns(start), ns(end), self_identifier)
+    return flush(client, store, window, max_lines, self_identifier, system_id,
+                 minutes)
+
+
+def ship(payload, url, system_id, secret, verify=True, timeout=60):
+    body = json.dumps(payload).encode()
+    request = urllib.request.Request(url.rstrip("/") + "/v1/bundles", data=body)
+    request.add_header("Content-Type", "application/json")
+    token = base64.b64encode("{0}:{1}".format(system_id, secret).encode()).decode()
+    request.add_header("Authorization", "Basic " + token)
+    if verify:
+        ctx = ssl.create_default_context()
+    else:
+        # Self-signed test servers only; verification is on by default.
+        ctx = ssl._create_unverified_context()
+    with urllib.request.urlopen(request, timeout=timeout, context=ctx) as response:
+        return response.status, response.read().decode()
+
+
+def mark_last_run():
+    """Record a successful ship for get-configuration to read back.
+
+    The daemon never exits between windows, so there is no
+    ExecMainExitTimestamp for get-configuration to read any more; it reads
+    this file instead, same pattern as the existing
+    cloud_log_manager_last_timestamp / syslog_last_timestamp files.
+    """
+    try:
+        with open(LAST_RUN_FILE, "w") as last_run_file:
+            last_run_file.write(
+                datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))
+    except OSError as exc:
+        print("could not write {0}: {1}".format(LAST_RUN_FILE, exc), file=sys.stderr)
+
+
+def is_quiet(payload):
+    """True when a bundle has nothing worth shipping.
+
+    A window is quiet when it produced no templates at all and no digest
+    row deviates enough from its own baseline to matter (row_deviates,
+    shared with flush() so the two decisions cannot disagree -- a
+    window judged quiet here must never contain a row flush() itself
+    prioritised as deviating). Reads only payload["templates"] and
+    payload["digest"], so this is a pure function of the assembled bundle
+    and can be tested without a Loki client.
+
+    Suppressing a quiet window saves the HTTP round trip and the server's
+    ingest work, but not LLM cost: the server's own gate already declines
+    an empty bundle before it would spend a token on one.
+    """
+    if payload["templates"]:
+        return False
+    return not any(row_deviates(row) for row in payload["digest"])
+
+
+def ship_bundle(payload, system_id, secret, url, verify):
+    """POST one assembled bundle, or explain why it did not go."""
+    if is_quiet(payload):
+        print("window {0}-{1}: quiet, suppressed".format(
+            payload["window"]["start"], payload["window"]["end"]))
+        # Still record the run: get-configuration reads LAST_RUN_FILE to
+        # report collector health, and skipping this write on a suppressed
+        # window would make a healthy quiet node look stalled instead of
+        # idle.
+        mark_last_run()
+        return True
+
+    try:
+        status, text = ship(payload, url, system_id, secret, verify=verify)
+    except urllib.error.HTTPError as exc:
+        print("ship failed {0}: {1}".format(exc.code,
+              exc.read().decode()[:300]), file=sys.stderr)
+        return False
+    except urllib.error.URLError as exc:
+        print("ship failed: {0}".format(exc.reason), file=sys.stderr)
+        return False
+    except TimeoutError:
+        # A hang after the request is fully sent surfaces here, not as
+        # URLError: urllib only wraps send-phase failures, not response-read
+        # timeouts on an already-open connection.
+        print("ship failed: timed out waiting for a response", file=sys.stderr)
+        return False
+
+    print("shipped {0} templates, {1} lines -> {2} {3}".format(
+        len(payload["templates"]), payload["budget"]["lines_kept"], status,
+        text.strip()))
+    mark_last_run()
+    return True
+
+
+def flush_and_ship(client, store, window, max_lines, module_id, url, verify,
+                   minutes=WINDOW_MINUTES):
+    """Close one window: drain the store into a bundle and send it.
+
+    flush() runs before the identity check, unlike the one-shot path below.
+    An unsubscribed or unreachable node still has to let go of the window,
+    or the aggregate it cannot send grows until the LRU cap is the only
+    thing holding the process inside its MemoryMax.
+    """
+    system_id, secret = read_identity()
+    payload = flush(client, store, window, max_lines,
+                    "{0}/insights-collector".format(module_id),
+                    system_id or "unknown", minutes)
+    if not system_id:
+        print("no subscription found; cannot ship bundles", file=sys.stderr)
+        return False
+    return ship_bundle(payload, system_id, secret, url, verify)
+
+
+def collect_and_ship(client, window, max_lines, module_id, url, verify,
+                     minutes=WINDOW_MINUTES):
+    """Run one closed window end-to-end. Returns True if the bundle shipped.
+
+    Identity is checked first here, before the Loki reads: a one-shot on an
+    unconfigured node should cost nothing, not a full collection it then
+    discards. The daemon cannot do the same -- see flush_and_ship.
+    """
+    system_id, secret = read_identity()
+    if not system_id:
+        print("no subscription found; cannot ship bundles", file=sys.stderr)
+        return False
+
+    try:
+        payload = collect_window(client, window, max_lines,
+                                 "{0}/insights-collector".format(module_id),
+                                 system_id, minutes)
+    except LokiError as exc:
+        print("collection failed: {0}".format(exc), file=sys.stderr)
+        return False
+    return ship_bundle(payload, system_id, secret, url, verify)
+
+
+def _sleep_interruptible(seconds, stop):
+    # Plain time.sleep() resumes after a signal (PEP 475), so a lone SIGTERM
+    # flag flip would not actually cut a 15-minute sleep short. Poll in small
+    # slices instead so shutdown reacts within a few seconds.
+    deadline = time.monotonic() + seconds
+    while not stop["flag"]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 5.0))
+
+
+def run_daemon(client, minutes, max_lines, module_id, url, verify):
+    """Follow the log stream, flushing a bundle on every window boundary.
+
+    The loop shape is the one the two sibling forwarders in this directory
+    use: read forward from a persisted cursor, handle the result line by
+    line, advance the cursor, sleep, repeat. The difference is what happens
+    to a line -- they write it to a socket, this masks and folds it into a
+    bounded store that a boundary then turns into a bundle.
+
+    The only state that grows is TemplateStore, and it is capped. The cursor
+    is a single integer on disk, so a restart resumes where it stopped
+    rather than losing whatever was in flight.
+    """
+    stop = {"flag": False}
+
+    def handle_stop(signum, frame):
+        stop["flag"] = True
+
+    signal.signal(signal.SIGTERM, handle_stop)
+    signal.signal(signal.SIGINT, handle_stop)
+
+    self_identifier = "{0}/insights-collector".format(module_id)
+    store = TemplateStore()
+
+    lag = datetime.timedelta(minutes=minutes * MAX_CATCHUP_WINDOWS)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cursor_ns = read_cursor()
+    if cursor_ns is None:
+        cursor_ns = ns(now)
+    elif cursor_ns < ns(now - lag):
+        print("cursor is {0:.0f} minutes behind; skipping forward".format(
+            (ns(now) - cursor_ns) / 6e10), file=sys.stderr)
+        cursor_ns = ns(now - lag)
+
+    window_start = ns_to_datetime(cursor_ns)
+    boundary = compute_window(now, minutes)[1] + datetime.timedelta(
+        minutes=minutes)
+    # Mirrors the old timer's RandomizedDelaySec, moved from the poll to the
+    # ship: the tail has to keep up with the log regardless, but 2700 nodes
+    # must not POST /v1/bundles on the same second. Re-rolled per window.
+    # Capped at a quarter of the window as well as at MAX_SHIP_JITTER, so a
+    # short --minutes cannot spend more time waiting than collecting.
+    max_jitter = min(MAX_SHIP_JITTER, minutes * 15)
+    jitter = random.uniform(0, max_jitter)
+
+    while not stop["flag"]:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if boundary < now - lag:
+            # Loki was unreachable long enough that replaying the gap would
+            # mean hundreds of windows of catch-up, each with its own
+            # baseline query and POST. Abandon the gap and resync instead.
+            print("{0:.0f} minutes behind; abandoning the gap".format(
+                (now - boundary).total_seconds() / 60), file=sys.stderr)
+            store.drain()
+            cursor_ns = ns(now - lag)
+            window_start = ns_to_datetime(cursor_ns)
+            boundary = compute_window(now, minutes)[1] + datetime.timedelta(
+                minutes=minutes)
+
+        try:
+            # Never read past the boundary while waiting out the jitter, so
+            # the store holds exactly the window it is about to be drained
+            # into and `expected` keeps comparing equal-length periods.
+            until_ns = min(time.time_ns() - READ_LAG_SECONDS * 1000000000,
+                           ns(boundary))
+            if until_ns > cursor_ns:
+                cursor_ns = drain_range(client, store, cursor_ns, until_ns,
+                                        self_identifier, stop)
+                write_cursor(cursor_ns)
+        except LokiError as exc:
+            # The cursor stays where it was, so the next tick re-reads the
+            # same range: a transient Loki restart costs a duplicate count,
+            # not a hole in the window.
+            print("tail failed: {0}".format(exc), file=sys.stderr)
+
+        if stop["flag"]:
+            break
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if now >= boundary + datetime.timedelta(seconds=jitter) \
+                and cursor_ns >= ns(boundary):
+            flush_and_ship(client, store, (window_start, boundary), max_lines,
+                           module_id, url, verify, minutes)
+            window_start = boundary
+            boundary += datetime.timedelta(minutes=minutes)
+            jitter = random.uniform(0, max_jitter)
+            if stop["flag"]:
+                break
+
+        _sleep_interruptible(TICK_SECONDS, stop)
+
+    # Rewind to the start of the window that never got shipped. The store
+    # dies with the process, so leaving the cursor at the high-water mark
+    # would drop everything read since the last flush -- the one thing the
+    # persisted cursor exists to prevent. Replaying costs a duplicate read;
+    # not replaying costs the lines.
+    write_cursor(ns(window_start))
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--max-lines", type=int, default=DEFAULT_MAX_LINES,
+                        help="most templates a bundle may carry, divided "
+                             "between module families (default: "
+                             "%(default)s)")
+    parser.add_argument("--minutes", type=int, default=WINDOW_MINUTES,
+                        help="bundle window in minutes (default: "
+                             "%(default)s). Under --daemon this is how often "
+                             "the accumulated stream is shipped; otherwise it "
+                             "is the size of the one closed window that gets "
+                             "read. Either way it also sets the baseline "
+                             "bucket the digest's `expected` is measured over")
+    parser.add_argument("--print", dest="show", action="store_true",
+                        help="write the bundle to stdout instead of shipping")
+    parser.add_argument("--daemon", action="store_true",
+                        help="follow the log stream, shipping a bundle every "
+                             "--minutes, instead of collecting one closed "
+                             "window and exiting")
+    args = parser.parse_args(argv)
+    if args.show and args.daemon:
+        parser.error("--print and --daemon are mutually exclusive")
+
+    try:
+        port = os.environ["LOKI_HTTP_PORT"]
+        client = Client("http://127.0.0.1:" + port,
+                        os.environ["LOKI_API_AUTH_USERNAME"],
+                        os.environ["LOKI_API_AUTH_PASSWORD"])
+    except KeyError as exc:
+        print("missing Loki variable {0}; run under runagent".format(exc),
+              file=sys.stderr)
+        return 1
+
+    module_id = os.environ.get("MODULE_ID", "loki1")
+
+    if args.show:
+        window = compute_window(datetime.datetime.now(datetime.timezone.utc),
+                                args.minutes)
+        try:
+            payload = collect_window(client, window, args.max_lines,
+                                     "{0}/insights-collector".format(module_id),
+                                     "unknown", args.minutes)
+        except LokiError as exc:
+            print("collection failed: {0}".format(exc), file=sys.stderr)
+            return 1
+        json.dump(payload, sys.stdout, indent=2)
+        print()
+        return 0
+
+    # Both cheap checks run before any Loki read: an unconfigured node
+    # should cost nothing to start, not a collection it then discards.
+    url = os.environ.get("INSIGHTS_SERVER_URL")
+    if not url:
+        print("INSIGHTS_SERVER_URL is not set", file=sys.stderr)
+        return 1
+    verify = os.environ.get("INSIGHTS_VERIFY_TLS", "").strip().lower() not in (
+        "0", "false", "no", "off")
+
+    if args.daemon:
+        return run_daemon(client, args.minutes, args.max_lines, module_id,
+                          url, verify)
+
+    window = compute_window(datetime.datetime.now(datetime.timezone.utc),
+                            args.minutes)
+    return 0 if collect_and_ship(client, window, args.max_lines, module_id,
+                                 url, verify, args.minutes) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

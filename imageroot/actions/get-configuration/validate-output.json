@@ -8,7 +8,8 @@
         "retention_days",
         "active_from",
         "cloud_log_manager",
-        "syslog"
+        "syslog",
+        "insights"
     ],
     "properties": {
         "retention_days": {
@@ -58,7 +59,6 @@
                     "description": "Log filter type."
                 }
             }
-
         },
         "syslog": {
             "type": "object",
@@ -94,6 +94,42 @@
                 "filter": {
                     "type": "string",
                     "description": "Log filter type."
+                }
+            }
+        },
+        "insights": {
+            "type": "object",
+            "title": "Insights collector",
+            "description": "State of the collector that ships deduplicated log bundles to the nethesis-insights service.",
+            "required": [
+                "status",
+                "subscription_configured"
+            ],
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": [
+                        "active",
+                        "failed",
+                        "inactive"
+                    ],
+                    "description": "State of insights-collector.service."
+                },
+                "base_url": {
+                    "type": "string",
+                    "description": "Base URL of the nethesis-insights server that receives the bundles."
+                },
+                "verify_tls": {
+                    "type": "boolean",
+                    "description": "Whether the server TLS certificate is verified."
+                },
+                "subscription_configured": {
+                    "type": "boolean",
+                    "description": "True when cluster/subscription holds identity data. An enabled collector with no subscription ships nothing."
+                },
+                "last_run": {
+                    "type": "string",
+                    "description": "Timestamp of the last successful bundle ship, empty if never run."
                 }
             }
         }

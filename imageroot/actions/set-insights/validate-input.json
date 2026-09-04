@@ -1,0 +1,40 @@
+{
+    "$schema": "http://json-schema.org/draft-04/schema#",
+    "$id": "http://schema.nethserver.org/loki/set-insights.json",
+    "title": "Configure the insights collector",
+    "description": "Configure the collector that ships deduplicated log bundles to the nethesis-insights service.",
+    "type": "object",
+    "properties": {
+        "active": {
+            "type": "boolean",
+            "description": "Enable or disable the insights collector daemon."
+        },
+        "base_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Base URL of the nethesis-insights server that receives the bundles."
+        },
+        "verify_tls": {
+            "type": "boolean",
+            "default": true,
+            "description": "Verify the server TLS certificate. Disable only when pointing at a self-signed test server."
+        }
+    },
+    "oneOf": [
+        {
+            "properties": {
+                "active": {"enum": [true]}
+            },
+            "required": [
+                "active",
+                "base_url"
+            ]
+        },
+        {
+            "properties": {
+                "active": {"enum": [false]}
+            },
+            "required": ["active"]
+        }
+    ]
+}
