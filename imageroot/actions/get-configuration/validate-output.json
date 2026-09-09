@@ -117,7 +117,7 @@
                 },
                 "base_url": {
                     "type": "string",
-                    "description": "Base URL of the nethesis-insights server that receives the bundles."
+                    "description": "Root URL of the nethesis-insights server, with no path — the collector appends /logs/v1/bundles itself."
                 },
                 "verify_tls": {
                     "type": "boolean",

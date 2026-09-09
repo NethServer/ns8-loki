@@ -1498,7 +1498,7 @@ def collect_window(client, window, max_lines, self_identifier, system_id,
 
 def ship(payload, url, system_id, secret, verify=True, timeout=60):
     body = json.dumps(payload).encode()
-    request = urllib.request.Request(url.rstrip("/") + "/v1/bundles", data=body)
+    request = urllib.request.Request(url.rstrip("/") + "/logs/v1/bundles", data=body)
     request.add_header("Content-Type", "application/json")
     token = base64.b64encode("{0}:{1}".format(system_id, secret).encode()).decode()
     request.add_header("Authorization", "Basic " + token)
@@ -1675,7 +1675,7 @@ def run_daemon(client, minutes, max_lines, module_id, url, verify):
         minutes=minutes)
     # Mirrors the old timer's RandomizedDelaySec, moved from the poll to the
     # ship: the tail has to keep up with the log regardless, but 2700 nodes
-    # must not POST /v1/bundles on the same second. Re-rolled per window.
+    # must not POST /logs/v1/bundles on the same second. Re-rolled per window.
     # Capped at a quarter of the window as well as at MAX_SHIP_JITTER, so a
     # short --minutes cannot spend more time waiting than collecting.
     max_jitter = min(MAX_SHIP_JITTER, minutes * 15)

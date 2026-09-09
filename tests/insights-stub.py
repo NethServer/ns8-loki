@@ -21,7 +21,7 @@ RECORD_FILE = sys.argv[2] if len(sys.argv) > 2 else "/tmp/insights-stub.jsonl"
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        if self.path != '/v1/bundles':
+        if self.path != '/logs/v1/bundles':
             self._send(404, b'not found')
             return
         length = int(self.headers.get('Content-Length') or 0)

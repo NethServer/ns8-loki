@@ -115,11 +115,15 @@ still shows up in the counts.
 #### Parameters
 
 - `active`: enable or disable the `insights-collector` daemon. Required.
-- `base_url`: base URL of the insights server. Required when `active` is
-  `true`. Some deployments path-mount the server (e.g.
-  `https://host/insights`) rather than serving it at the bare host, in which
-  case that path segment is part of `base_url`; check with
-  `curl <base_url>/healthz`, which should return `200`.
+- `base_url`: root URL of the insights server, with no path. Required when
+  `active` is `true`. The collector appends `/logs/v1/bundles` itself: the
+  server runs its three pipelines as separate services behind one proxy, which
+  strips a per-pipeline prefix, so `/logs` belongs to the endpoint rather than
+  to the deployment. `ns8-crowdsec` reads the same `INSIGHTS_SERVER_URL` and
+  appends its own `/blocklist/...` paths the same way.
+  Check reachability with `curl -u <system_id>:<token> <base_url>/logs/v1/findings`,
+  which should answer `200`, or `401` with a bad credential — anything else,
+  and the URL is wrong. (`/healthz` is deliberately not routed by the proxy.)
 - `verify_tls`: verify the server TLS certificate. Optional, default `true`.
   Set to `false` only for a self-signed test server — never against a
   production endpoint.
