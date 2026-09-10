@@ -1,0 +1,15 @@
+[Unit]
+Description=Nethesis insights collector
+Requires=loki-server.service
+After=loki-server.service
+
+[Service]
+Type=simple
+EnvironmentFile=%E/state/environment
+ExecStart=runagent %E/bin/insights-collector --daemon
+SyslogIdentifier=%u/%N
+Restart=on-failure
+RestartSec=30s
+# Defense in depth alongside the collector's own per-window memory hygiene:
+# a runaway leak gets killed and restarted rather than growing unbounded.
+MemoryMax=256M

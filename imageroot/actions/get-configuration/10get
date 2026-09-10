@@ -65,13 +65,44 @@ try:
 except:
     syslog["last_timestamp"] = ""
 
+# Insights
+
+insights = {}
+
+insights_status = subprocess.run(['systemctl', '--user', 'is-active', 'insights-collector.service'], capture_output=True, text=True)
+match insights_status.stdout.strip():
+    case 'active':
+        insights["status"] = 'active'
+    case 'failed':
+        insights["status"] = 'failed'
+    case _:
+        insights["status"] = 'inactive'
+
+insights["base_url"] = os.getenv('INSIGHTS_SERVER_URL', '')
+insights["verify_tls"] = os.getenv('INSIGHTS_VERIFY_TLS', '1') != '0'
+
+# This is what tells the UI why an enabled collector ships nothing: the
+# collector reads identity from cluster/subscription at run time and has no
+# module secret of its own.
+insights["subscription_configured"] = bool(rdb.hgetall('cluster/subscription'))
+
+# The collector is a long-running daemon, not a oneshot fired by a timer, so
+# there is no ExecMainExitTimestamp per window any more: it writes its own
+# last-successful-ship timestamp instead.
+try:
+    with open("./insights_last_run", "r") as insights_file:
+        insights["last_run"] = insights_file.read()
+except OSError:
+    insights["last_run"] = ""
+
 # General
 
 response = {
     "retention_days": int(os.getenv('LOKI_RETENTION_PERIOD')),
     "active_from": os.getenv('LOKI_ACTIVE_FROM'),
     "cloud_log_manager": cloud_log_manager,
-    "syslog": syslog
+    "syslog": syslog,
+    "insights": insights
 }
 
 if os.getenv('LOKI_ACTIVE_TO') is not None:
