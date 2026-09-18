@@ -232,16 +232,40 @@ def _record_tail(collector, monkeypatch, result=()):
 
 def test_tail_reads_module_id_and_category_and_sorts(collector, monkeypatch):
     _, out = _record_tail(collector, monkeypatch, [
-        {"stream": {"module_id": "loki1", "category": "security"},
+        {"stream": {"module_id": "loki1", "category": "security", "node_id": "2"},
          "values": [["3000000", "first"], ["1000000", "second"]]},
-        {"stream": {"module_id": "traefik1"},
+        {"stream": {"module_id": "traefik1", "node_id": "1"},
          "values": [["2000000", "third"]]},
     ])
     assert out == [
-        (1000000, "second", "loki1", "security"),
-        (2000000, "third", "traefik1", ""),
-        (3000000, "first", "loki1", "security"),
+        (1000000, "second", "loki1", "security", 2),
+        (2000000, "third", "traefik1", "", 1),
+        (3000000, "first", "loki1", "security", 2),
     ]
+
+
+def test_tail_reads_the_node_id_label(collector, monkeypatch):
+    """node_id sits in the same per-series label map module_id and category
+    come from, so node attribution costs no extra query -- it was being
+    aggregated away, not fetched."""
+    _, out = _record_tail(collector, monkeypatch, [
+        {"stream": {"module_id": "loki1", "node_id": "3"},
+         "values": [["1000000", "line"]]},
+    ])
+    assert out[0][4] == 3
+
+
+@pytest.mark.parametrize("raw", [None, "", "0", "-1", "leader", "1.5"])
+def test_tail_rejects_an_unusable_node_id(collector, monkeypatch, raw):
+    """NS8 numbers nodes from 1, so 0 is a missing field rather than a
+    machine and anything unparseable is not attribution at all."""
+    stream = {"module_id": "loki1"}
+    if raw is not None:
+        stream["node_id"] = raw
+    _, out = _record_tail(collector, monkeypatch, [
+        {"stream": stream, "values": [["1000000", "line"]]},
+    ])
+    assert out[0][4] is None
 
 
 def test_tail_keeps_nanoseconds(collector, monkeypatch):

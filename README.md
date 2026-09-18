@@ -217,6 +217,19 @@ is read, so an unscrubbed line is never held in memory for a whole window.
 Each template carries at most two example lines, truncated to 512
 characters. This is defence in depth, not a guarantee.
 
+One piece of identifying data is sent deliberately: the cluster's **node
+roster**, so a finding can name the machine it concerns. A subscription
+identifies a cluster, not a machine, and one collector reports for all of its
+nodes, so without this a reported problem could not say which node produced
+it. Each bundle therefore carries the node numbers a template was seen on,
+plus a list of `{node_id, fqdn}` for the cluster.
+
+The FQDN does not come from your logs. Hostnames inside log lines are still
+masked by `mask()`, unchanged. The name is read separately from each node's
+own `ns8_node_info` metric — published by NethServer core on every node — and
+if a node's exporter cannot be reached, its number is sent without a name
+rather than the bundle failing. `--print` shows exactly what would be sent.
+
 The destination is the Nethesis insights service, authenticated with the
 subscription identity (`system_id` and secret) the node already holds —
 nothing new to provision or store. This is an explicit improvement over the

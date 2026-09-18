@@ -841,8 +841,12 @@ class Client:
             labels = series.get("stream") or {}
             module_id = labels.get("module_id", HOST_BUCKET)
             category = labels.get("category", "")
+            # node_id sits in the same per-series label map module_id and
+            # category are read from, so carrying it costs no extra query --
+            # it was being aggregated away, not fetched.
+            node_id = _parse_node_id(labels.get("node_id"))
             for timestamp, text in series.get("values") or []:
-                out.append((int(timestamp), text, module_id, category))
+                out.append((int(timestamp), text, module_id, category, node_id))
         out.sort()
         return out
 
@@ -1027,6 +1031,10 @@ def cluster_templates(entries):
                         "first_seen": entry["first_seen"],
                         "last_seen": entry["last_seen"],
                         "samples": list(entry["samples"]),
+                        # Copied, not aliased: the merge below mutates this
+                        # set, and the entry it came from is still the
+                        # caller's.
+                        "nodes": set(entry.get("nodes") or ()),
                     },
                 })
                 continue
@@ -1045,6 +1053,12 @@ def cluster_templates(entries):
             merged["count"] += entry["count"]
             merged["first_seen"] = min(merged["first_seen"], entry["first_seen"])
             merged["last_seen"] = max(merged["last_seen"], entry["last_seen"])
+            # Attribution is a union across the fold, never the winner's set:
+            # the same condition can mask to different variants on different
+            # nodes, and keeping only the representative's nodes would blame
+            # whichever node happened to produce the busiest variant. The
+            # server's prompt.Select does the same at its own fold.
+            merged.setdefault("nodes", set()).update(entry.get("nodes") or ())
             # Same first-then-overwrite-last convention TemplateStore
             # uses for duplicate raw lines, one level up: keep the first
             # sample seen, and let the most recently merged entry's own
@@ -1128,7 +1142,7 @@ class TemplateStore:
         self.lines_seen = 0
         self.evicted = 0
 
-    def ingest(self, ts_ms, raw, module_id, category):
+    def ingest(self, ts_ms, raw, module_id, category, node_id=None):
         clean = sanitize_line(raw)
         template = mask(clean)
         match = PRIORITY_RE.match(clean)
@@ -1147,6 +1161,10 @@ class TemplateStore:
                 "category": category,
                 "first_seen": ts_ms, "last_seen": ts_ms,
                 "samples": [sample],
+                # A set, not a list: the same template recurs thousands of
+                # times per node in a window and the wire wants each node
+                # once. Converted to a sorted list at bundle time.
+                "nodes": {node_id} if node_id else set(),
             }
             while len(self._entries) > self._max:
                 self._entries.popitem(last=False)
@@ -1156,6 +1174,8 @@ class TemplateStore:
         entry["count"] += 1
         entry["first_seen"] = min(entry["first_seen"], ts_ms)
         entry["last_seen"] = max(entry["last_seen"], ts_ms)
+        if node_id:
+            entry["nodes"].add(node_id)
         # Keep the first and last raw line only; the server caps at 2.
         if len(entry["samples"]) == 1:
             entry["samples"].append(sample)
@@ -1180,9 +1200,167 @@ class TemplateStore:
         return entries, observed, seen, evicted
 
 
-def build_bundle(system_id, collector_version, window, digest_rows, templates, budget):
+# --------------------------------------------------------------------------
+# Node attribution.
+#
+# A system_id is an NS8 *cluster*, not a machine: one collector runs per
+# cluster and reads Loki, which aggregates every node. Loki carries a node_id
+# stream label on every record, so the node is already in hand -- it was being
+# thrown away. Carrying it lets a finding say WHICH machine, and the roster
+# below turns that number into the name an administrator actually knows.
+#
+# The name comes from node_exporter, not from log text. Hostnames in log lines
+# stay masked (see _mask_hostname); this is a separate, structured field read
+# from the cluster's own inventory:
+#
+#   ns8_node_info{fqdn="rl1.example.org",wg0_port="55820"} 1
+#
+# written by ns8-core's refresh-node-info into node_exporter's textfile
+# directory. Both are CORE systemd units present on every node, and
+# node_exporter runs --network=host with no --web.listen-address, so it binds
+# :9100 on every interface including WireGuard. That is what makes this
+# reachable cluster-wide, from whichever node happens to run Loki.
+#
+# Prometheus was the obvious alternative and is the wrong one: it binds
+# 127.0.0.1:9091 inside the metrics module, so it is reachable only from its
+# own node, and its cluster-wide Traefik route exists only when an
+# administrator has set prometheus_path -- and is then behind forward_auth.
+# node_exporter needs no module installed, no configuration and no credential.
+# --------------------------------------------------------------------------
+
+NODE_EXPORTER_PORT = 9100
+
+# The roster changes when a node is added, removed or renamed -- events
+# measured in months, not minutes -- so it is cached well past the 15-minute
+# window rather than re-scraped on every flush.
+ROSTER_TTL_SECONDS = 3600
+
+# Per-node scrape timeout. Short on purpose: a node that does not answer
+# promptly costs its own name and nothing else, and the flush must not wait
+# on it.
+ROSTER_TIMEOUT_SECONDS = 5
+
+NS8_NODE_INFO_RE = re.compile(r'^ns8_node_info\{([^}]*)\}')
+NODE_INFO_FQDN_RE = re.compile(r'fqdn="([^"]*)"')
+
+
+def _parse_node_id(raw):
+    """A Loki node_id label as a positive int, or None.
+
+    None rather than 0: NS8 numbers nodes from 1, so 0 would be a machine
+    that does not exist, and the server drops it anyway.
+    """
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 1 else None
+
+
+def read_cluster_nodes():
+    """[(node_id, vpn_ip), ...] for the cluster, from Redis.
+
+    The VPN address is the one every node can reach every other node on, and
+    it is already in Redis for other reasons -- there is no separate
+    inventory to keep in step.
+    """
+    import agent  # deferred: unavailable in the unit-test container
+
+    rdb = agent.redis_connect()
+    out = []
+    for key in rdb.keys("node/*/vpn"):
+        if isinstance(key, bytes):
+            key = key.decode()
+        node_id = _parse_node_id(key.split("/")[1])
+        if node_id is None:
+            continue
+        ip_address = rdb.hget(key, "ip_address")
+        if isinstance(ip_address, bytes):
+            ip_address = ip_address.decode()
+        if ip_address:
+            out.append((node_id, ip_address))
+    out.sort()
+    return out
+
+
+def scrape_node_fqdn(ip_address, timeout=ROSTER_TIMEOUT_SECONDS):
+    """One node's FQDN from its node_exporter, or None.
+
+    Parses the one metric it needs rather than pulling in a Prometheus text
+    parser: the line shape is fixed by ns8-core's refresh-node-info, and a
+    change there should fail visibly here rather than be absorbed.
+    """
+    url = "http://{0}:{1}/metrics".format(ip_address, NODE_EXPORTER_PORT)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            for raw in response:
+                line = raw.decode("utf-8", "replace")
+                if not line.startswith("ns8_node_info{"):
+                    continue
+                labels = NS8_NODE_INFO_RE.match(line)
+                if not labels:
+                    continue
+                fqdn = NODE_INFO_FQDN_RE.search(labels.group(1))
+                if fqdn:
+                    return fqdn.group(1) or None
+                return None
+    except Exception:
+        # Every failure mode is the same failure: no name for this node this
+        # time. Losing the roster must cost attribution names, never the run
+        # -- the same contract digest() and baseline_series() follow.
+        return None
+    return None
+
+
+def build_roster(nodes):
+    """[{"node_id": N, "fqdn": "..."}, ...] for the wire.
+
+    A node whose exporter did not answer is still listed, with no fqdn: the
+    id is the attribution and the name is a convenience on top of it, and the
+    server keeps any name it already knows rather than blanking it.
+    """
+    roster = []
+    for node_id, ip_address in nodes:
+        entry = {"node_id": node_id}
+        fqdn = scrape_node_fqdn(ip_address)
+        if fqdn:
+            entry["fqdn"] = fqdn
+        roster.append(entry)
+    return roster
+
+
+class RosterCache:
+    """build_roster() behind a TTL, so a flush scrapes at most once an hour.
+
+    Keeps the last good roster on failure: a transient scrape failure must
+    not make the bundle look like a cluster that lost its nodes.
+    """
+
+    def __init__(self, ttl=ROSTER_TTL_SECONDS, reader=None, builder=None):
+        self._ttl = ttl
+        self._reader = reader or read_cluster_nodes
+        self._builder = builder or build_roster
+        self._roster = []
+        self._fetched_at = None
+
+    def get(self, now):
+        if self._fetched_at is not None and (now - self._fetched_at) < self._ttl:
+            return self._roster
+        try:
+            roster = self._builder(self._reader())
+        except Exception as exc:
+            print("roster lookup failed: {0}".format(exc), file=sys.stderr)
+            return self._roster
+        self._fetched_at = now
+        if roster:
+            self._roster = roster
+        return self._roster
+
+
+def build_bundle(system_id, collector_version, window, digest_rows, templates,
+                 budget, nodes=None):
     """Assemble the wire payload."""
-    return {
+    bundle = {
         "schema_version": SCHEMA_VERSION,
         "system_id": system_id,
         "collector_version": collector_version,
@@ -1192,6 +1370,12 @@ def build_bundle(system_id, collector_version, window, digest_rows, templates, b
         "templates": templates,
         "budget": budget,
     }
+    # Omitted rather than sent empty when the roster is unavailable: the
+    # field is optional on the wire and an empty list would say "this
+    # cluster has no nodes", which is never true.
+    if nodes:
+        bundle["nodes"] = nodes
+    return bundle
 
 
 # --------------------------------------------------------------------------
@@ -1327,8 +1511,8 @@ def drain_range(client, store, since_ns, until_ns, self_identifier,
         if stop is not None and stop["flag"]:
             return cursor
         rows = client.tail(cursor, until_ns, DENYLIST, self_identifier)
-        for timestamp, text, module_id, category in rows:
-            store.ingest(timestamp // 1000000, text, module_id, category)
+        for timestamp, text, module_id, category, node_id in rows:
+            store.ingest(timestamp // 1000000, text, module_id, category, node_id)
         if len(rows) < TAIL_LIMIT:
             break
         # A full page ends wherever it ends; resume one nanosecond past its
@@ -1338,7 +1522,7 @@ def drain_range(client, store, since_ns, until_ns, self_identifier,
 
 
 def flush(client, store, window, max_lines, self_identifier, system_id,
-          minutes=WINDOW_MINUTES):
+          minutes=WINDOW_MINUTES, roster=None):
     """Turn what the store has accumulated into a bundle, and reset it.
 
     The store is drained first and unconditionally: whatever happens below,
@@ -1447,6 +1631,13 @@ def flush(client, store, window, max_lines, self_identifier, system_id,
         for entry in kept:
             if not entry.get("category"):
                 entry.pop("category", None)
+            # A set is not JSON, and the wire wants each node once, sorted.
+            # Dropped entirely when empty rather than sent as [], which the
+            # server would read the same way but which says "seen on no
+            # node" -- a thing that cannot happen.
+            nodes = sorted(entry.pop("nodes", None) or ())
+            if nodes:
+                entry["nodes"] = nodes
 
         family_kept = sum(entry["count"] for entry in kept)
         templates.extend(kept)
@@ -1477,11 +1668,12 @@ def flush(client, store, window, max_lines, self_identifier, system_id,
 
     return build_bundle(
         system_id,
-        COLLECTOR_VERSION, (ms(start), ms(end)), digest_rows, templates, budget)
+        COLLECTOR_VERSION, (ms(start), ms(end)), digest_rows, templates, budget,
+        nodes=roster)
 
 
 def collect_window(client, window, max_lines, self_identifier, system_id,
-                   minutes=WINDOW_MINUTES):
+                   minutes=WINDOW_MINUTES, roster=None):
     """One closed window, start to finish: the one-shot path.
 
     Exactly the daemon's two steps -- drain_range fills a store, flush turns
@@ -1493,7 +1685,7 @@ def collect_window(client, window, max_lines, self_identifier, system_id,
     store = TemplateStore()
     drain_range(client, store, ns(start), ns(end), self_identifier)
     return flush(client, store, window, max_lines, self_identifier, system_id,
-                 minutes)
+                 minutes, roster=roster)
 
 
 def ship(payload, url, system_id, secret, verify=True, timeout=60):
@@ -1583,7 +1775,7 @@ def ship_bundle(payload, system_id, secret, url, verify):
 
 
 def flush_and_ship(client, store, window, max_lines, module_id, url, verify,
-                   minutes=WINDOW_MINUTES):
+                   minutes=WINDOW_MINUTES, roster=None):
     """Close one window: drain the store into a bundle and send it.
 
     flush() runs before the identity check, unlike the one-shot path below.
@@ -1594,7 +1786,8 @@ def flush_and_ship(client, store, window, max_lines, module_id, url, verify,
     system_id, secret = read_identity()
     payload = flush(client, store, window, max_lines,
                     "{0}/insights-collector".format(module_id),
-                    system_id or "unknown", minutes)
+                    system_id or "unknown", minutes,
+                    roster=roster.get(time.time()) if roster else None)
     if not system_id:
         print("no subscription found; cannot ship bundles", file=sys.stderr)
         return False
@@ -1602,7 +1795,7 @@ def flush_and_ship(client, store, window, max_lines, module_id, url, verify,
 
 
 def collect_and_ship(client, window, max_lines, module_id, url, verify,
-                     minutes=WINDOW_MINUTES):
+                     minutes=WINDOW_MINUTES, roster=None):
     """Run one closed window end-to-end. Returns True if the bundle shipped.
 
     Identity is checked first here, before the Loki reads: a one-shot on an
@@ -1617,7 +1810,8 @@ def collect_and_ship(client, window, max_lines, module_id, url, verify,
     try:
         payload = collect_window(client, window, max_lines,
                                  "{0}/insights-collector".format(module_id),
-                                 system_id, minutes)
+                                 system_id, minutes,
+                                 roster=(roster or RosterCache()).get(time.time()))
     except LokiError as exc:
         print("collection failed: {0}".format(exc), file=sys.stderr)
         return False
@@ -1680,6 +1874,9 @@ def run_daemon(client, minutes, max_lines, module_id, url, verify):
     # short --minutes cannot spend more time waiting than collecting.
     max_jitter = min(MAX_SHIP_JITTER, minutes * 15)
     jitter = random.uniform(0, max_jitter)
+    # Scraped at most once an hour and kept across failures -- see
+    # RosterCache. The daemon owns it so the cache survives windows.
+    roster = RosterCache()
 
     while not stop["flag"]:
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -1718,7 +1915,7 @@ def run_daemon(client, minutes, max_lines, module_id, url, verify):
         if now >= boundary + datetime.timedelta(seconds=jitter) \
                 and cursor_ns >= ns(boundary):
             flush_and_ship(client, store, (window_start, boundary), max_lines,
-                           module_id, url, verify, minutes)
+                           module_id, url, verify, minutes, roster=roster)
             window_start = boundary
             boundary += datetime.timedelta(minutes=minutes)
             jitter = random.uniform(0, max_jitter)
@@ -1777,7 +1974,8 @@ def main(argv=None):
         try:
             payload = collect_window(client, window, args.max_lines,
                                      "{0}/insights-collector".format(module_id),
-                                     "unknown", args.minutes)
+                                     "unknown", args.minutes,
+                                     roster=RosterCache().get(time.time()))
         except LokiError as exc:
             print("collection failed: {0}".format(exc), file=sys.stderr)
             return 1

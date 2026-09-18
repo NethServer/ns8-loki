@@ -76,10 +76,16 @@ def flush_lines(collector):
     pin a share the way they used to pass one to group_templates().
     """
     def run(lines, max_lines=collector.DEFAULT_MAX_LINES, client=None,
-            store=None):
+            store=None, roster=None):
         store = store if store is not None else collector.TemplateStore()
-        for ts_ms, text, module_id, category in lines:
-            store.ingest(ts_ms, text, module_id, category)
+        for row in lines:
+            # A row may carry a trailing node_id; the older four-field shape
+            # means "no attribution", which is what a pre-node collector and
+            # an unlabelled stream both produce.
+            ts_ms, text, module_id, category = row[:4]
+            node_id = row[4] if len(row) > 4 else None
+            store.ingest(ts_ms, text, module_id, category, node_id)
         return collector.flush(client or FakeLokiClient(), store, WINDOW,
-                               max_lines, "self-id", "system-123")
+                               max_lines, "self-id", "system-123",
+                               roster=roster)
     return run

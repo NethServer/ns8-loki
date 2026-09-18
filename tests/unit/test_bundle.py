@@ -297,7 +297,7 @@ def test_flush_reads_loki_only_for_the_baseline(flush_lines, collector):
 # --------------------------------------------------------------------------
 
 def _page(collector, count, first_ns=1000):
-    return [(first_ns + i, "<6> [sshd] line {0}".format(i), "", "")
+    return [(first_ns + i, "<6> [sshd] line {0}".format(i), "", "", 1)
             for i in range(count)]
 
 
