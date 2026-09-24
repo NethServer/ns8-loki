@@ -21,3 +21,14 @@ for evar in [
         # NOTE: LOKI_ACTIVE_TO is restored by a later step
     ]:
     agent.set_env(evar, original_environment[evar])
+
+# Unit enablement is not part of module state, so 95insights re-enables the
+# insights-collector daemon from these values after a restore. Without them a
+# previously-configured collector would come back silently disabled. These
+# are optional, because insights is disabled by default.
+for evar in [
+        "INSIGHTS_SERVER_URL",
+        "INSIGHTS_VERIFY_TLS",
+    ]:
+    if evar in original_environment:
+        agent.set_env(evar, original_environment[evar])

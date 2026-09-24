@@ -17,7 +17,18 @@ if data['action'] == 'terminated':
     agent.unset_env('CLOUD_LOG_MANAGER_ADDRESS')
     agent.unset_env('CLOUD_LOG_MANAGER_TENANT')
 
-    subprocess.run(["systemctl", "--user", "disable", "--now", "cloud-log-manager-forwarder.service"], 
+    subprocess.run(["systemctl", "--user", "disable", "--now", "cloud-log-manager-forwarder.service"],
                     stdout=sys.stderr,
                     stderr=sys.stderr,
                     check=True)
+
+    # A terminated subscription would otherwise leave the daemon running
+    # every 15 minutes against an identity that no longer validates.
+    agent.munset_env(['INSIGHTS_SERVER_URL', 'INSIGHTS_VERIFY_TLS'])
+
+    # check=False: the service may never have been enabled, and that must
+    # not fail the event handler.
+    subprocess.run(["systemctl", "--user", "disable", "--now", "insights-collector.service"],
+                    stdout=sys.stderr,
+                    stderr=sys.stderr,
+                    check=False)
