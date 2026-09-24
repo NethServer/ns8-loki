@@ -227,19 +227,32 @@ def sanitize_line(raw):
 # of the 678 distinct rows -- one per module instance, across seven
 # families -- because `@` was missing from rule 10's character class.
 #
+# 5: FOLD_RULES (below) fold the spans a line echoes rather than states --
+# rspamd's per-message symbol list, a scanner's SIP payload quoted back by
+# kamailio, a provisioning data dump, an HTTP request body, a stack trace, a
+# hex byte dump -- and new token rules fold ctime and tomcat dates, 0x
+# pointers, ULIDs, mixed-case opaque ids, rspamd log tags, SIP call ids and
+# dialog tags, and nethcti user names; a run of one repeated placeholder
+# collapses to one. Measured on the dev fleet's 2026-09-24 system_templates
+# dump: 6,768 templates were first seen in seven days on four clusters, and
+# rspamd, kamailio, nethvoice, systemd-coredump, freepbx and prometheus
+# minted ~90% of them, each through one volatile token the rules had no
+# shape for. Every one of those windows looked novel to the server's gate
+# and bought an LLM call.
+#
 # That burst is CORRELATED, not the independent trickle the server's
 # novelty gate is sized for: every template on every node goes novel in
 # the same window at once when this version first reaches a node. Do NOT
 # deploy this version before the server's LLM_MAX_CONCURRENCY limit and
 # its daily spend cap are live -- without them a fleet-wide simultaneous
 # novelty burst is an unbounded LLM bill, not a one-time blip.
-MASKING_VERSION = 4
+MASKING_VERSION = 5
 
 # Placeholders already present in the input are left alone, which is what
 # makes mask() idempotent. Listed here so one rule can protect all of them.
 _PLACEHOLDER = (
     r'<(?:TS|PID|UUID|IP|PORT|HEX|NUM|PATH|USER|DATE|HOST|CC|PCT'
-    r'|redacted[a-z-]*)>'
+    r'|ID|DATA|TRACE|BYTES|SYMBOLS|redacted[a-z-]*)>'
 )
 
 # A leading "<N>" syslog priority marker, if present, is a syntactic prefix
@@ -283,6 +296,159 @@ def _mask_hostname(match):
     return '<HOST>'
 
 
+_MONTH = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'
+
+
+def _char_class(ch):
+    if ch.islower():
+        return 'l'
+    if ch.isupper():
+        return 'u'
+    if ch.isdigit():
+        return 'd'
+    return 'o'
+
+
+# How often a random identifier switches between lower case, upper case,
+# digits and punctuation, per character. Measured on the dev fleet: a
+# socket.io sid or a Nextcloud request id switches 0.5-0.75 times per
+# character, while the names the three-class test alone also caught --
+# "InvalidAsn1Error", "fanvil-H2U-senzaled", "yealink-T33-PADOVA" -- switch
+# 0.2-0.35 times, because words are runs of one class.
+OPAQUE_ID_MIN_SWITCH_RATE = 0.4
+
+
+def _mask_opaque_id(match):
+    """Return <ID> for a token that switches character class often enough
+    to be random, and the token unchanged otherwise -- see
+    OPAQUE_ID_MIN_SWITCH_RATE above."""
+    token = match.group(0)
+    switches = sum(1 for a, b in zip(token, token[1:])
+                   if _char_class(a) != _char_class(b))
+    if switches / len(token) >= OPAQUE_ID_MIN_SWITCH_RATE:
+        return '<ID>'
+    return token
+
+# Folds run first, on the whole line, before MASKING_RULES. They exist for
+# the spans a line ECHOES rather than states -- a symbol list, a quoted
+# payload, a request body, a stack trace -- whose content is volatile as a
+# whole. They cannot be token rules: MASKING_RULES are applied between the
+# placeholders already present (see _mask_apply), and scrub() has usually
+# put a <redacted-email> or <redacted-blob> inside exactly these spans, so a
+# token rule could never match across one. A fold swallows the placeholders
+# it spans on purpose.
+#
+# Each fold keeps the text that names the condition and replaces only what
+# follows it, and each is idempotent on its own output -- see the per-rule
+# notes, since these rules are not protected by _mask_apply.
+FOLD_RULES = [
+    # rspamd's per-message summary lists every symbol that scored, with its
+    # weight and options: one template per combination, i.e. per email. The
+    # action before the list -- "T (reject)", "F (no action)" -- is the
+    # signal and is kept. The replacement starts with "<", which the
+    # symbol-name class can never match, so a second pass is a no-op.
+    (
+        re.compile(r'\[(?:-?[A-Z][A-Z0-9_]*\([^)]*\)\{[^}]*\},?)+\]'),
+        '[<SYMBOLS>]',
+    ),
+    # The message id in the same summary. Its shape is whatever the sending
+    # MUA chose -- an address, a bracketed IP, a random token -- so it gets
+    # one placeholder rather than whatever scrub() happened to leave.
+    (
+        re.compile(r'(rspamd_task_write_log: id: )<\S*?>(?=,)'),
+        r'\1<ID>',
+    ),
+    # Payloads a daemon quotes back verbatim: a scanner's SIP bytes echoed by
+    # kamailio's parser, rsyslog's "begin of message is:" preview of a line it
+    # truncated, tancredi's provisioning data dump, and an HTTP request body
+    # logged after its method and path. The prefix names the condition; what
+    # follows is the sender's data. Every replacement ends in <DATA>, which
+    # each pattern re-matches into itself.
+    (
+        re.compile(r'(parse_msg: message=)<.*'),
+        r'\1<DATA>',
+    ),
+    (
+        re.compile(r'(parse_via\(\): (?:parse error, parsed so far:|parsing via on:)) ?.*'),
+        r'\1 <DATA>',
+    ),
+    (
+        re.compile(r'(bad header field )\[.*'),
+        r'\1<DATA>',
+    ),
+    (
+        re.compile(r'(begin of message is: ).*'),
+        r'\1<DATA>',
+    ),
+    (
+        re.compile(r'(Rendered template "[^"]*" with data: ).*'),
+        r'\1<DATA>',
+    ),
+    (
+        re.compile(r'(\b(?:GET|POST|PUT|PATCH|DELETE) /\S* )\{.*\}\s*$'),
+        r'\1<DATA>',
+    ),
+    # systemd-coredump's stack trace: frame count and addresses differ on
+    # every crash. The process name before it is the signal and is kept.
+    (
+        re.compile(r'(Stack trace of thread )\d+:.*'),
+        r'\1<NUM>: <TRACE>',
+    ),
+    # Hex byte dumps -- the kernel's "Code:" line after an oops. Eight or
+    # more whitespace-separated two-digit hex bytes, one optionally marked
+    # <..> as the faulting byte.
+    (
+        re.compile(r'(?<!\S)(?:<?[0-9a-fA-F]{2}>? ){7,}<?[0-9a-fA-F]{2}>?(?!\S)'),
+        '<BYTES>',
+    ),
+    # PHP truncates string arguments in a stack trace to fifteen characters
+    # plus "...", so what survives is a random-looking prefix of an id or a
+    # user name.
+    (
+        re.compile(r"'[^']*\.\.\.'"),
+        "'<DATA>'",
+    ),
+    # kamailio dialog identifiers: the Call-ID, the From/To tags and the
+    # record-route parameter, each single-quoted after its keyword -- with a
+    # space, ": " or "=" between them depending on the module that logs it.
+    # All are random per call.
+    (
+        re.compile(r"(\b(?:clid|tags|call-id|callid|route param|caller tag|callee tag"
+                   r"|ftag|ttag))(:? |=)'[^']*'(?: '[^']*')*"),
+        r"\1\2'<ID>'",
+    ),
+    # The Call-ID kamailio's own routing script logs right after the route
+    # name, "(route[DISPATCHER_FAILURE]) <call-id> INVITE-...".
+    (
+        re.compile(r'(\(route\[[\w-]+\]\) )(?!<ID>)\S+'),
+        r'\1<ID>',
+    ),
+    # SIP Call-IDs of the "<n>_<digits>@<host>" shape kamailio's own script
+    # logs and rtpengine print unquoted.
+    (
+        re.compile(r'\b\d+_\d{5,}@'),
+        '<ID>@',
+    ),
+    # nethcti user names and socket.io session ids. The account is in the
+    # retained sample line, the same trade rules 13 and 14 make.
+    (
+        re.compile(r'(authorized successfully \([^)]*\) to )"[^"]*"'),
+        r'\1"<USER>"',
+    ),
+    (
+        re.compile(r'(\bws connection from )\S+'),
+        r'\1<USER>',
+    ),
+    (
+        re.compile(r'(\brequester=)[^\s,;]+'),
+        r'\1<USER>',
+    ),
+    (
+        re.compile(r'(\bsid:? )[\w-]+'),
+        r'\1<ID>',
+    ),
+]
+
 MASKING_RULES = [
     # 1. Volatile paths. Before any number rule, or /proc/12345 loses its
     #    shape and stops matching as a path at all.
@@ -300,6 +466,16 @@ MASKING_RULES = [
             r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}'
             r'(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?'
         ),
+        '<TS>',
+    ),
+    # 2b. ctime timestamps, as Apache and PHP write them:
+    #     "[Fri Sep 19 10:15:30.123456 2026]". Before rule 3, which would
+    #     otherwise take only the clock and leave the weekday, the month and
+    #     the day of the month literal -- one template per day for every
+    #     line freepbx and webtop's Apache write.
+    (
+        re.compile(r'\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) ' + _MONTH +
+                   r' +\d{1,2} \d{2}:\d{2}:\d{2}(?:\.\d+)?(?: \d{4})?\b'),
         '<TS>',
     ),
     # 3. Bare clock times. Before the port rule, which would otherwise claim
@@ -326,12 +502,49 @@ MASKING_RULES = [
         re.compile(r'\b\d{1,2}/[A-Za-z]{3}/\d{4}\b'),
         '<DATE>',
     ),
+    # 5b. The same with dashes, as Tomcat writes it ("24-Sep-2026"). The
+    #     month class is explicit so "12-Foo-2026" is left alone.
+    (
+        re.compile(r'\b\d{1,2}-' + _MONTH + r'-\d{4}\b'),
+        '<DATE>',
+    ),
     # 6. UUIDs. Must precede the hex rule, which would otherwise shred a UUID
     #    into <HEX>-<HEX>-... and produce a template that never groups.
     (
         re.compile(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}'
                    r'-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'),
         '<UUID>',
+    ),
+    # 6b. "0x"-prefixed pointers and offsets -- kamailio's connection and
+    #     dialog addresses, coredump frames. Rule 12 cannot see these: there
+    #     is no word boundary between the "x" and the first hex digit.
+    (
+        re.compile(r'\b0x[0-9a-fA-F]+\b'),
+        '<HEX>',
+    ),
+    # 6c. ULIDs (Prometheus TSDB block ids): 26 Crockford base32 characters,
+    #     the first of which is 0-7. Upper-case only, so rule 6d misses them.
+    (
+        re.compile(r'\b[0-7][0-9A-HJKMNP-TV-Z]{25}\b'),
+        '<ID>',
+    ),
+    # 6d. Opaque identifiers: sixteen or more word characters mixing lower
+    #     case, upper case AND digits -- socket.io session ids, Nextcloud
+    #     request ids. Requiring all three classes keeps this off most
+    #     ordinary text ("ContainerCreateError" has no digit,
+    #     "nethvoice-proxy10" no capital, "SIP-T31G" is too short), and
+    #     _mask_opaque_id's class-switch floor keeps it off the rest -- see
+    #     there. scrub() already took anything of 32+ such characters as a
+    #     blob, so this covers the 16-31 range it leaves behind.
+    (
+        re.compile(r'(?<![\w-])(?=[\w-]*[a-z])(?=[\w-]*[A-Z])(?=[\w-]*\d)[\w-]{16,}(?![\w-])'),
+        lambda m: _mask_opaque_id(m),
+    ),
+    # 6e. rspamd's per-task log tag, "<5eb7e3>", which opens every line a
+    #     task writes. Before the hex rule, which needs eight characters.
+    (
+        re.compile(r'<[0-9a-fA-F]{5,6}>'),
+        '<HEX>',
     ),
     # 7. IPv6. Must precede the hex rule for the same reason as UUIDs, and
     #    precede IPv4 so an IPv4-mapped form is taken whole. The compressed
@@ -439,6 +652,13 @@ MASKING_RULES = [
         re.compile(r'(?i)\b(user(?:name)?)\s+(?!<)\S+'),
         r'\1 <USER>',
     ),
+    # 14b. The same, written "user: name" -- nethcti's "(user: alessandro)".
+    #      The value stops at a closing parenthesis as well as at the usual
+    #      separators, so the ")" of that shape survives.
+    (
+        re.compile(r'(?i)\b(user(?:name)?):\s*(?!<)[^\s,;)]+'),
+        r'\1: <USER>',
+    ),
     # 15. GeoIP country codes written as a field, e.g. "country=US" or
     #     "country_code: IT". The (?!<) guard does the same job as in
     #     rules 13 and 14: it is what stops a second mask() pass from
@@ -519,6 +739,13 @@ MASKING_RULES = [
 # second mask() call from rewriting <PID> into <[<PID>]> or <NUM> into <<NUM>>.
 _PROTECTED = re.compile(_PLACEHOLDER)
 
+# A run of one placeholder repeated, separated by spaces or commas, folds to
+# a single one: "rcpts: <e>,<e>,<e>" and 'sources="[<ID> <ID> <ID>]"' would
+# otherwise mint a template per list length. Applied after every rule, to
+# the whole line, because it matches placeholders -- the one thing
+# _mask_apply keeps the rules away from.
+_REPEATED_PLACEHOLDER = re.compile(r'(<<?[A-Za-z][\w-]*>>?)(?:[ ,]+\1)+')
+
 
 def mask(line):
     """Return the template form of one already-scrubbed log line.
@@ -528,8 +755,11 @@ def mask(line):
     in particular rule 20's single-digit rule -- can ever touch it.
     """
     prefix, rest = _split_priority(line)
+    for pattern, replacement in FOLD_RULES:
+        rest = pattern.sub(replacement, rest)
     for pattern, replacement in MASKING_RULES:
         rest = _mask_apply(pattern, replacement, rest)
+    rest = _REPEATED_PLACEHOLDER.sub(r'\1', rest)
     return prefix + rest
 
 
