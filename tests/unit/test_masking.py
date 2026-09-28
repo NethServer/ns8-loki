@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 """Tests for scrub(), sanitize_line() and mask() in insights-collector."""
+import re
+
 import pytest
 
 # A broad sample of lines exercised elsewhere in this file, reused here so
@@ -541,5 +543,190 @@ def test_v5_repeated_placeholders_collapse_but_distinct_ones_do_not(collector):
     assert collector.mask("from <IP> to <HOST>") == "from <IP> to <HOST>"
 
 
-def test_v5_masking_version(collector):
-    assert collector.MASKING_VERSION == 5
+
+# --------------------------------------------------------------------------
+# Masking version 6: the leaks measured on the dev fleet's 2026-09-28
+# system_templates dump, among the 1,522 novel lines seen on no other
+# system. Same shape as the version 5 section above: pairs that must mask
+# to ONE template, pairs that must stay apart.
+# --------------------------------------------------------------------------
+
+SNOM_REQUEST = (
+    "<3> [nethvoice12] [2026-09-28 10:00:00] tancredi.INFO: Serving request from "
+    "10.0.0.5 Mozilla/4.0 (compatible; snomD713-SIP 10.4.5.6 10.4.5-v10-rc2 "
+    "(Mar 12 2025 - 10:11:12) 000413E59FB4 SXM:0 UXM:0 UXMC:0): "
+    "http://pbx.example.com:80/provisioning/a1b2c3d4e5f6a7b8/000413e59fb4.xml "
+    "(00-04-13-E5-9F-B4)"
+)
+
+SAME_TEMPLATE_V6 = {
+    "snom provisioning request, another model and firmware": (
+        SNOM_REQUEST,
+        "<3> [nethvoice12] [2026-09-28 10:05:00] tancredi.INFO: Serving request from "
+        "10.0.0.8 Mozilla/4.0 (compatible; snom725-SIP 10.4.5.9 10.1.54.13 "
+        "000413A0CB21 SXM:0 UXM:0): "
+        "http://pbx.example.com:80/provisioning/a1b2c3d4e5f6a7b8/snom725.htm "
+        "(00-04-13-A0-CB-21)",
+    ),
+    "provisioning request, snom and fanvil": (
+        SNOM_REQUEST,
+        "<3> [nethvoice12] [2026-09-28 10:06:00] tancredi.INFO: Serving request from "
+        "10.0.0.6 Fanvil W610W 2.12.18 0c383e6b0cff: "
+        "http://pbx.example.com:80/provisioning/a1b2c3d4e5f6a7b8/0c383e6b0cff.cfg "
+        "(0C-38-3E-6B-0C-FF)",
+    ),
+    "provisioning request, snom and yealink with its MAC in the UA": (
+        SNOM_REQUEST,
+        "<3> [nethvoice12] [2026-09-28 10:07:00] tancredi.INFO: Serving request from "
+        "10.0.0.7 Yealink SIP-T31P 124.86.0.40 80:5e:c0:12:34:56: "
+        "http://pbx.example.com:80/provisioning/a1b2c3d4e5f6a7b8/y000000000123.cfg "
+        "(80-5E-C0-12-34-56)",
+    ),
+    "invalid token request": (
+        "[2026-09-28 10:00:00] tancredi.WARNING: Invalid token request from 10.0.0.7 "
+        "Yealink W70B 146.85.0.20 80:5e:c0:12:34:56: http://10.0.0.1/provisioning/x9/805ec0123456.cfg",
+        "[2026-09-28 10:01:00] tancredi.WARNING: Invalid token request from 10.0.0.9 "
+        "Fanvil W620W 2.14.0 0c383e6b0d00: http://10.0.0.1/provisioning/y7/0c383e6b0d00.cfg",
+    ),
+    "RFC 1123 date, another weekday": (
+        "Sun, 21 Sep 2026 10:11:12 GMT sequelize deprecated Use sequelize.fn / "
+        "sequelize.col to construct attributes at <anonymous>:null:null",
+        "Fri, 26 Sep 2026 23:00:59 GMT sequelize deprecated Use sequelize.fn / "
+        "sequelize.col to construct attributes at <anonymous>:null:null",
+    ),
+    "rspamd map check, weekdays and a tag that is not hex": (
+        "(controller) <qbq3yk>; map; http_map_finish: data is not modified for server "
+        "maps.rspamd.com, next check at Mon, 22 Sep 2026 10:11:12 GMT "
+        "(http cache based: Mon, 22 Sep 2026 10:11:12 GMT)",
+        "(controller) <5eb7e3>; map; http_map_finish: data is not modified for server "
+        "maps.rspamd.com, next check at Sat, 27 Sep 2026 08:00:00 GMT "
+        "(http cache based: Sat, 27 Sep 2026 08:00:00 GMT)",
+    ),
+    "RFC 2822 date with an offset": (
+        "Received: from mx.example.com; Mon, 22 Sep 2026 10:11:12 +0200",
+        "Received: from mx.example.com; Thu, 1 Oct 2026 07:00:00 -0500",
+    ),
+    "firmware build date": (
+        "firmware snom 10.1.54.13 (Mar 12 2025 - 10:11:12) loaded",
+        "firmware snom 10.1.54.13 (Jul  3 2024 - 23:59:01) loaded",
+    ),
+    "date with the month as a word": (
+        "certificate valid until Sep 21, 2026",
+        "certificate valid until Thursday, 1 October 2026",
+    ),
+    "syslog timestamp without a weekday": (
+        "Sep 21 10:11:12 pbx asterisk[123]: reload",
+        "Oct  3 01:02:03 pbx asterisk[123]: reload",
+    ),
+    # Leak 4 turned out not to be a rule miss: v5's rule 6b masks both of
+    # these, and every unmasked pointer in the 2026-09-28 dump came from one
+    # system still running a masking version 4 collector. Pinned here in the
+    # exact shapes the dump holds so a later rule cannot reopen them.
+    "kamailio dialog pointer before a bracket": (
+        "next_state_dlg(): bogus event 5 in state 3 for dlg 0x7f43109d5b80 [1234:5678] "
+        "with clid '1_1120169619@198.51.100.1' and tags 'abc' 'def'",
+        "next_state_dlg(): bogus event 5 in state 3 for dlg 0x7f3b5aa8f940 [4321:8765] "
+        "with clid '550e8400-e29b-41d4-a716-446655440000' and tags 'ghi' ''",
+    ),
+    "bare pointer token": (
+        "tcp_read_req(): error reading - c: 0x7fce0d6cf280 r: 0x7fce0d6cf3a8 (-104)",
+        "tcp_read_req(): error reading - c: 0x7f4310957b90 r: 0x7f4310957cb8 (-104)",
+    ),
+    "bare pointer at the end of a line": (
+        "#FailureMessage Object: 0x7ffcf4fe0a70",
+        "#FailureMessage Object: 0x7ffd593e4a50",
+    ),
+    "pointers in parentheses": (
+        "get_body(): failed to locate end of headers (0x55b49809ad40 0x55b49809aeb1 - 12 34 [])",
+        "get_body(): failed to locate end of headers (0x5601aa000010 0x5601aa0000f1 - 56 78 [])",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(SAME_TEMPLATE_V6))
+def test_v6_volatile_lines_fold_to_one_template(collector, name):
+    first, second = SAME_TEMPLATE_V6[name]
+    assert _template(collector, first) == _template(collector, second)
+
+
+@pytest.mark.parametrize("name", sorted(SAME_TEMPLATE_V6))
+def test_v6_folds_are_idempotent(collector, name):
+    for raw in SAME_TEMPLATE_V6[name]:
+        once = _template(collector, raw)
+        assert collector.mask(once) == once
+
+
+def test_v6_provisioning_request_template(collector):
+    assert _template(collector, SNOM_REQUEST) == (
+        "<3> [nethvoice] [<TS>] <HOST>: Serving request from <IP> <UA>: "
+        "http://<HOST>:<NUM>/provisioning/<PATH> (<MAC>)"
+    )
+
+
+DISTINCT_TEMPLATE_V6 = {
+    "the provisioning path's first segment is signal": (
+        SNOM_REQUEST,
+        SNOM_REQUEST.replace("/provisioning/", "/tancredi/"),
+    ),
+    "a date in a different place is a different line": (
+        "next check at Mon, 22 Sep 2026 10:11:12 GMT (timer based)",
+        "next check at Mon, 22 Sep 2026 10:11:12 GMT (http cache based)",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(DISTINCT_TEMPLATE_V6))
+def test_v6_folds_keep_distinct_conditions_apart(collector, name):
+    first, second = DISTINCT_TEMPLATE_V6[name]
+    assert _template(collector, first) != _template(collector, second)
+
+
+# A MAC names one device, so like an address it must never reach a stored
+# template -- in any of the shapes daemons print it, and in particular not
+# as the "<DATE>-E5-9F-B4" half-address the numeric-date rule used to leave.
+MAC_LINES = [
+    "(00-04-13-E5-9F-B4)",
+    "Serving request from 10.0.0.5 Mozilla/4.0 (compatible): http://h/p (00-04-13-E5-9F-B4)",
+    "dnsmasq-dhcp: DHCPACK(eth0) 10.0.0.5 00:04:13:e5:9f:b4 snom",
+    "eth0: link up, HWaddr 0C:38:3E:6B:0C:FF.",
+    "mac:80:5e:c0:12:34:56: unknown",
+    '{"mac":"80-5E-0C-11-22-33","model":"T31P"}',
+    "all digits 00-15-65-12-34-56 here",
+    "cisco form 0004.13e5.9fb4 learned",
+]
+
+
+@pytest.mark.parametrize("raw", MAC_LINES)
+def test_v6_a_mac_address_never_survives_masking(collector, raw):
+    out = _template(collector, raw)
+    assert "<MAC>" in out
+    # No two adjacent octets of any MAC, in any separator, are left.
+    assert not re.search(r'[0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}', out), out
+    assert not re.search(r'[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}', out), out
+    assert "<DATE>-" not in out
+
+
+@pytest.mark.parametrize("text,kept", [
+    # kamailio's module marker and a JSON parser's complaint keep their
+    # angle-bracketed words: the rspamd tag rule needs ") " before and ";"
+    # after.
+    ("ERROR: <core> [core/tcp_read.c:12]: tcp_read_req(): error", "<core>"),
+    ("Unexpected token <script> in JSON at position 0", "<script>"),
+    # A clock is not a MAC, and neither is an IPv6 address.
+    ("reload at 10:11:12 done", "<TS>"),
+    ("addr 2001:db8::1 unreachable", "<IP>"),
+])
+def test_v6_new_rules_leave_lookalikes_alone(collector, text, kept):
+    out = _template(collector, text)
+    assert kept in out
+    assert "<MAC>" not in out
+
+
+def test_v6_templates_carry_no_wildcards(collector):
+    """<*> used to be written by cluster_templates(), never by mask(); with
+    it gone nothing in the collector produces one."""
+    assert not hasattr(collector, "cluster_templates")
+
+
+def test_v6_masking_version(collector):
+    assert collector.MASKING_VERSION == 6

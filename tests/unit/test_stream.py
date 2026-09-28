@@ -199,8 +199,8 @@ def test_drain_resets_everything(collector):
 
 
 def test_drain_hands_over_ownership(collector):
-    """The caller mutates the entries it gets (cluster_templates pops the
-    empty category key), so the store must not still be holding them."""
+    """The caller mutates the entries it gets (flush() pops the empty
+    category key), so the store must not still be holding them."""
     store = collector.TemplateStore()
     store.ingest(*_line(0))
     entries, _observed, _seen, _evicted = store.drain()

@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Nethesis S.r.l.
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-"""Tests for cluster_templates() and the flush() pipeline in insights-collector."""
+"""Tests for rank_templates() and the flush() pipeline in insights-collector."""
 import random
 
 import pytest
@@ -22,148 +22,178 @@ def _entry(template, count=1, module_id="mod1", priority=3, category="metrics",
     }
 
 
+def _templates(entries):
+    return [entry["template"] for entry in entries]
+
+
 # --------------------------------------------------------------------------
-# cluster_templates()
+# rank_templates()
 # --------------------------------------------------------------------------
 
 DELETING_OBSOLETE_BLOCK = [
-    _entry('<3> [prometheus] msg="Deleting obsolete block" component=eu duration=5s'),
-    _entry('<3> [prometheus] msg="Deleting obsolete block" component=us duration=7s'),
-    _entry('<3> [prometheus] msg="Deleting obsolete block" component=ap duration=9s'),
+    _entry('<3> [prometheus] msg="Deleting obsolete block" component=eu duration=5s', count=5),
+    _entry('<3> [prometheus] msg="Deleting obsolete block" component=us duration=7s', count=4),
+    _entry('<3> [prometheus] msg="Deleting obsolete block" component=ap duration=9s', count=3),
 ]
 
 WRITE_BLOCK = [
-    _entry('<3> [prometheus] msg="write block" ooo=false size=100mb'),
-    _entry('<3> [prometheus] msg="write block" ooo=false size=200mb'),
+    _entry('<3> [prometheus] msg="write block" ooo=false size=100mb', count=2),
+    _entry('<3> [prometheus] msg="write block" ooo=false size=200mb', count=1),
 ]
 
 
-def test_cluster_deleting_obsolete_block_variants_fold_into_one(collector):
-    out = collector.cluster_templates(DELETING_OBSOLETE_BLOCK)
-    assert len(out) == 1
-    assert 'msg="Deleting obsolete block"' in out[0]["template"]
-    assert out[0]["variants"] == 3
-    assert out[0]["count"] == 3
+def test_rank_never_rewrites_merges_or_drops_an_entry(collector):
+    """The whole of masking version 6's fix: the entries that come out are
+    the entries that went in, text untouched and no <*> anywhere."""
+    family = DELETING_OBSOLETE_BLOCK + WRITE_BLOCK
+    before = [dict(entry) for entry in family]
+    out = collector.rank_templates(list(family))
+
+    assert all("<*>" not in entry["template"] for entry in out)
+    assert all("variants" not in entry for entry in out)
+    assert sorted(out, key=lambda e: e["template"]) == \
+        sorted(before, key=lambda e: e["template"])
 
 
-def test_cluster_write_block_variants_fold_keeping_ooo_false(collector):
-    out = collector.cluster_templates(WRITE_BLOCK)
-    assert len(out) == 1
-    assert 'msg="write block"' in out[0]["template"]
-    assert "ooo=false" in out[0]["template"]
-    assert out[0]["variants"] == 2
-
-
-def test_cluster_two_families_together_yield_two_clusters(collector):
-    out = collector.cluster_templates(DELETING_OBSOLETE_BLOCK + WRITE_BLOCK)
-    assert len(out) == 2
-    templates = [entry["template"] for entry in out]
-    assert any('msg="Deleting obsolete block"' in t for t in templates)
-    assert any('msg="write block"' in t for t in templates)
-
-
-def test_cluster_wildcards_only_the_varying_position(collector):
-    out = collector.cluster_templates(DELETING_OBSOLETE_BLOCK)
-    tokens = out[0]["template"].split()
-    # '<3> [prometheus] msg="Deleting obsolete block" component=X durationYs'
-    # tokenises to 7 positions; component (index 5) and duration (index 6)
-    # both vary across the family, every other position stays literal.
-    assert tokens[0] == "<3>"
-    assert tokens[1] == "[prometheus]"
-    assert tokens[3] == "obsolete"
-    assert tokens[4] == 'block"'
-    assert tokens[5] == "<*>"
-    assert tokens[6] == "<*>"
-    assert out[0]["variants"] == len(DELETING_OBSOLETE_BLOCK)
-    assert out[0]["count"] == sum(e["count"] for e in DELETING_OBSOLETE_BLOCK)
-
-
-def test_cluster_different_token_counts_never_merge(collector):
-    entries = [
-        _entry("<3> [prometheus] short line"),
-        _entry("<3> [prometheus] a much longer line here"),
+def test_rank_puts_every_shape_before_a_second_spelling(collector):
+    out = collector.rank_templates(DELETING_OBSOLETE_BLOCK + WRITE_BLOCK)
+    # Rank 0, busiest first: the busiest spelling of each of the two shapes.
+    assert _templates(out[:2]) == [
+        DELETING_OBSOLETE_BLOCK[0]["template"],
+        WRITE_BLOCK[0]["template"],
     ]
-    out = collector.cluster_templates(entries)
-    assert len(out) == 2
-
-
-def test_cluster_different_priorities_never_merge(collector):
-    entries = [
-        _entry("<3> [prometheus] same shape token", priority=3),
-        _entry("<3> [prometheus] same shape token", priority=6),
+    # Rank 1: each shape's second spelling. Rank 2: the one left.
+    assert _templates(out[2:4]) == [
+        DELETING_OBSOLETE_BLOCK[1]["template"],
+        WRITE_BLOCK[1]["template"],
     ]
-    out = collector.cluster_templates(entries)
-    assert len(out) == 2
+    assert _templates(out[4:]) == [DELETING_OBSOLETE_BLOCK[2]["template"]]
 
 
-def test_cluster_different_categories_never_merge(collector):
+def test_rank_a_rare_distinct_line_beats_a_busy_near_duplicate(collector):
+    """What the ranking is for: capped by count alone, a share of two would
+    go to two spellings of the Deleting line and the one-off would be
+    truncated away."""
+    rare = _entry("<3> [prometheus] level=error msg=corruption detected in wal", count=1)
+    out = collector.rank_templates(DELETING_OBSOLETE_BLOCK + [rare])
+    assert rare["template"] in _templates(out[:2])
+
+
+def test_rank_different_token_counts_are_different_shapes(collector):
     entries = [
-        _entry("<3> [prometheus] same shape token", category="metrics"),
-        _entry("<3> [prometheus] same shape token", category="security"),
+        _entry("<3> [prometheus] short line", count=5),
+        _entry("<3> [prometheus] short line two", count=4),
+        _entry("<3> [prometheus] short other", count=1),
     ]
-    out = collector.cluster_templates(entries)
-    assert len(out) == 2
-
-
-def test_cluster_position_zero_never_wildcarded(collector):
-    # Same bucket (priority/category/token count) but the literal text at
-    # position 0 differs between the two entries -- it must never be
-    # rewritten to <*>, only positions 1..n are ever eligible.
-    entries = [
-        _entry("<3> [prometheus] same shape alpha", priority=3),
-        _entry("<9> [prometheus] same shape alpha", priority=3),
+    out = collector.rank_templates(entries)
+    # "short line two" has a token count of its own, so it is a rank-0 shape
+    # and outranks the lower-count second spelling of "short line".
+    assert _templates(out) == [
+        "<3> [prometheus] short line",
+        "<3> [prometheus] short line two",
+        "<3> [prometheus] short other",
     ]
-    out = collector.cluster_templates(entries)
-    assert len(out) == 1
-    tokens = out[0]["template"].split()
-    assert tokens[0] in ("<3>", "<9>")
-    assert tokens[0] != "<*>"
 
 
-def test_cluster_deterministic_under_shuffled_input(collector):
+@pytest.mark.parametrize("field,values", [
+    ("priority", (3, 6)),
+    ("category", ("metrics", "security")),
+])
+def test_rank_different_priorities_and_categories_are_different_shapes(
+        collector, field, values):
+    first = _entry("<3> [prometheus] same shape token", count=5)
+    near = _entry("<3> [prometheus] same shape other", count=4)
+    apart = _entry("<3> [prometheus] same shape token", count=1)
+    first[field], near[field], apart[field] = values[0], values[0], values[1]
+    out = collector.rank_templates([first, near, apart])
+    assert out == [first, apart, near]
+
+
+def test_rank_deterministic_under_shuffled_input(collector):
     family = [
         _entry('<3> [x] msg="event" tag=alpha n=1', count=5),
         _entry('<3> [x] msg="event" tag=beta n=2', count=1),
         _entry('<3> [x] msg="event" tag=gamma n=3', count=3),
-        _entry('<3> [x] msg="event" tag=delta n=4', count=2),
+        _entry('<3> [x] msg="other" code=delta', count=2),
         _entry('<3> [x] msg="event" tag=epsilon n=5', count=4),
+        _entry('<3> [x] msg="event" tag=alpha n=1', count=1, category="security"),
     ]
-    baseline = collector.cluster_templates(list(family))
+    baseline = collector.rank_templates(list(family))
     for seed in (1, 2, 3, 42):
         shuffled = list(family)
         random.Random(seed).shuffle(shuffled)
-        result = collector.cluster_templates(shuffled)
-        assert result == baseline
+        assert collector.rank_templates(shuffled) == baseline
 
 
-def test_cluster_single_entry_no_variants_key(collector):
-    out = collector.cluster_templates([_entry("<3> [x] lone event")])
-    assert len(out) == 1
-    assert "variants" not in out[0]
-
-
-def test_cluster_empty_template_does_not_raise(collector):
-    entries = [_entry(""), _entry("")]
-    out = collector.cluster_templates(entries)
+def test_rank_empty_template_does_not_raise(collector):
+    entries = [_entry(""), _entry("", category="security")]
+    out = collector.rank_templates(entries)
     assert len(out) == 2
-    for entry in out:
-        assert "variants" not in entry
 
 
-def test_cluster_empty_input(collector):
-    assert collector.cluster_templates([]) == []
+def test_rank_empty_input(collector):
+    assert collector.rank_templates([]) == []
 
 
 # --------------------------------------------------------------------------
-# flush(): the cluster-then-sort-then-truncate-to-share pipeline that used
-# to be the tail of group_templates().
+# CLUSTER_SIMILARITY itself.
+#
+# These pin the threshold from both sides, using entries deliberately built
+# to share a priority, a category AND a token count, so the match ratio is
+# the only thing left that can decide whether two templates are one shape.
 # --------------------------------------------------------------------------
 
-DELETING_LINES = [
-    (100, '<3> [prometheus] msg="Deleting obsolete block" region=eu', "modx", "metrics"),
-    (101, '<3> [prometheus] msg="Deleting obsolete block" region=us', "modx", "metrics"),
-    (102, '<3> [prometheus] msg="Deleting obsolete block" region=ap', "modx", "metrics"),
+# Six tokens each; the warn line agrees with the other two only on the
+# two-token scaffolding: 2/6 = 0.33, below the 0.5 threshold, so it is a
+# shape of its own. Lowering the threshold far enough would rank it behind
+# every spelling of the deleting line.
+_SAME_LENGTH_DISTINCT = [
+    _entry('<3> [prometheus] level=info msg=deleting_obsolete_block '
+           'component=tsdb block=<HEX>', count=65),
+    _entry('<3> [prometheus] level=info msg=deleting_obsolete_block '
+           'component=head block=<HEX>', count=60),
+    _entry('<3> [prometheus] level=warn msg=write_block mint=<HEX> '
+           'maxt=<HEX>', count=53),
 ]
+
+
+def test_distinct_conditions_of_equal_length_are_two_shapes(collector):
+    out = collector.rank_templates(list(_SAME_LENGTH_DISTINCT))
+    assert "write_block" in out[1]["template"], _templates(out)
+
+
+def test_near_duplicates_of_equal_length_are_one_shape(collector):
+    # Five tokens differing in exactly one position: 4/5 = 0.8, comfortably
+    # above the threshold. Raising the threshold past that would let the
+    # near-duplicates crowd the distinct line out of a share of two.
+    family = [_entry('<3> [prometheus] msg=compaction shard=%d done' % shard,
+                     count=10 - shard)
+              for shard in range(4)]
+    distinct = _entry('<3> [prometheus] msg=reload failed badly', count=1)
+    out = collector.rank_templates(family + [distinct])
+    assert out[1] is distinct
+
+
+def test_two_families_same_token_count_are_two_shapes(collector):
+    """Same token count, no shared tokens after position 0 -- below
+    CLUSTER_SIMILARITY."""
+    nethvoice = _entry("<3> [nethvoice] aaa bbb ccc ddd", module_id="nethvoice")
+    openldap = _entry("<3> [openldap] eee fff ggg hhh", module_id="openldap")
+    near = _entry("<3> [nethvoice] aaa bbb ccc zzz", count=5, module_id="nethvoice")
+
+    out = collector.rank_templates([nethvoice, openldap, near])
+    assert out == [near, openldap, nethvoice]
+
+
+# --------------------------------------------------------------------------
+# flush(): rank, truncate to the share, ship busiest first.
+# --------------------------------------------------------------------------
+
+DELETING_LINES = (
+    [(100, '<3> [prometheus] msg="Deleting obsolete block" region=eu', "modx", "metrics")] * 3
+    + [(101, '<3> [prometheus] msg="Deleting obsolete block" region=us', "modx", "metrics")] * 2
+    + [(102, '<3> [prometheus] msg="Deleting obsolete block" region=ap', "modx", "metrics")]
+)
 
 SSHD_LINES = [
     (200, '<6> [sshd] Accepted publickey for alice', "modx", ""),
@@ -171,25 +201,25 @@ SSHD_LINES = [
 ]
 
 
-def test_flush_clusters_before_truncating(flush_lines):
-    """5 raw lines fold (via masking + clustering) to 2 distinct template
-    shapes. A share of 2 must keep both -- if truncation ran on the raw,
-    pre-cluster count (5), a share of 2 could arbitrarily drop one whole
-    family instead."""
+def test_flush_ranks_before_truncating(flush_lines):
+    """Six Deleting lines in three spellings and two sshd lines. A share of
+    two must keep one of each condition -- by count alone it would keep two
+    spellings of the Deleting line and drop sshd entirely."""
     bundle = flush_lines(DELETING_LINES + SSHD_LINES, max_lines=2)
     templates = bundle["templates"]
-    assert bundle["budget"]["lines_seen"] == 5
+    assert bundle["budget"]["lines_seen"] == 8
     assert len(templates) == 2
-    assert bundle["budget"]["lines_kept"] == sum(t["count"] for t in templates)
-    assert bundle["budget"]["lines_kept"] == 5
+    assert 'region=eu' in templates[0]["template"]
+    assert "Accepted publickey" in templates[1]["template"]
+    assert bundle["budget"]["lines_kept"] == 4
 
 
 def test_flush_most_frequent_first(flush_lines):
-    bundle = flush_lines(DELETING_LINES + SSHD_LINES, max_lines=10)  # 3 vs 2
-    templates = bundle["templates"]
-    assert len(templates) == 2
-    assert templates[0]["count"] >= templates[1]["count"]
-    assert 'msg="Deleting obsolete block"' in templates[0]["template"]
+    templates = flush_lines(DELETING_LINES + SSHD_LINES, max_lines=10)["templates"]
+    assert len(templates) == 5
+    counts = [t["count"] for t in templates]
+    assert counts == sorted(counts, reverse=True)
+    assert 'region=eu' in templates[0]["template"]
 
 
 def test_flush_empty_category_dropped_non_empty_kept(flush_lines):
@@ -206,8 +236,8 @@ def test_flush_truncated_to_share(flush_lines):
     bundle = flush_lines(DELETING_LINES + SSHD_LINES, max_lines=1)
     templates = bundle["templates"]
     assert len(templates) == 1
-    assert 'msg="Deleting obsolete block"' in templates[0]["template"]
-    assert bundle["budget"]["lines_kept"] == templates[0]["count"]
+    assert 'region=eu' in templates[0]["template"]
+    assert bundle["budget"]["lines_kept"] == templates[0]["count"] == 3
 
 
 def test_flush_records_the_truncation(flush_lines):
@@ -217,8 +247,8 @@ def test_flush_records_the_truncation(flush_lines):
     truncated = bundle["budget"]["truncated_modules"]
     assert [row["module_id"] for row in truncated] == ["modx"]
     assert truncated[0]["truncated"] is True
-    # 5 lines seen, 3 kept in the one surviving shape.
-    assert truncated[0]["dropped"] == 2
+    # 8 lines seen, 3 kept in the one surviving template.
+    assert truncated[0]["dropped"] == 5
 
 
 def test_flush_no_truncation_key_when_everything_fits(flush_lines):
@@ -235,54 +265,60 @@ def test_flush_empty_input(flush_lines):
 
 
 # --------------------------------------------------------------------------
-# CLUSTER_SIMILARITY itself.
+# The template is a function of the line, not of the window.
 #
-# The two evidence families above are also separated by their differing
-# token counts, so they would stay apart even with the threshold set to
-# almost zero -- they pin the wildcarding, not the threshold. These two
-# tests pin the threshold from both sides, using entries deliberately built
-# to share a priority, a category AND a token count, so the match ratio is
-# the only thing left that can decide the outcome.
+# Masking versions 3 to 5 wildcarded every position where two templates of
+# one window differed, so the same line shipped as a different template in
+# different windows -- literal when alone, and with a <*> wherever its
+# neighbours of the moment disagreed with it. The dev fleet's
+# system_templates held 733 such rows on 2026-09-28, and each looked novel
+# to the server's gate once.
 # --------------------------------------------------------------------------
 
-# Six tokens each, agreeing only on the two-token scaffolding: 2/6 = 0.33,
-# below the 0.5 threshold, so these must stay apart. Lowering the threshold
-# far enough would merge two genuinely distinct conditions into one shape
-# and lose both.
-_SAME_LENGTH_DISTINCT = [
-    _entry('<3> [prometheus] level=info msg=deleting_obsolete_block '
-           'component=tsdb block=<HEX>', count=65),
-    _entry('<3> [prometheus] level=warn msg=write_block mint=<HEX> '
-           'maxt=<HEX>', count=53),
+NETHCTI_LINE = ("<3> [nethvoice4] 2026-09-28T10:00:00.123Z - warn: [com_nethcti_ws] "
+                "ws disconnected undefined - reason: transport close (user: alessandro)")
+
+NETHCTI_NEIGHBOURS = [
+    # Differs in one token: v5 shipped both as "transport <*>".
+    ("<3> [nethvoice4] 2026-09-28T10:00:01.456Z - warn: [com_nethcti_ws] "
+     "ws disconnected undefined - reason: transport error (user: alessandro)"),
+    # Differs in another: v5 shipped both as "ws disconnected <*>".
+    ("<3> [nethvoice4] 2026-09-28T10:00:02.789Z - warn: [com_nethcti_ws] "
+     "ws disconnected 10.0.0.9 - reason: transport close (user: alessandro)"),
 ]
 
 
-def test_distinct_conditions_of_equal_length_do_not_merge(collector):
-    out = collector.cluster_templates(list(_SAME_LENGTH_DISTINCT))
-    assert len(out) == 2, [entry["template"] for entry in out]
-    assert any("deleting_obsolete_block" in entry["template"] for entry in out)
-    assert any("write_block" in entry["template"] for entry in out)
-    # Neither kept a wildcard: nothing was folded, so nothing was lost.
-    assert all("<*>" not in entry["template"] for entry in out)
+@pytest.mark.parametrize("neighbours", [
+    [],
+    NETHCTI_NEIGHBOURS[:1],
+    NETHCTI_NEIGHBOURS[1:],
+    NETHCTI_NEIGHBOURS,
+    NETHCTI_NEIGHBOURS * 5,
+])
+def test_a_line_ships_the_same_template_whatever_else_is_in_the_window(
+        collector, flush_lines, neighbours):
+    want = collector.mask(collector.sanitize_line(NETHCTI_LINE))
+    lines = [(100 + i, text, "nethvoice4", "")
+             for i, text in enumerate([NETHCTI_LINE] + neighbours)]
+
+    templates = flush_lines(lines, max_lines=10)["templates"]
+
+    assert want in [t["template"] for t in templates]
+    assert all("<*>" not in t["template"] for t in templates)
 
 
-def test_near_duplicates_of_equal_length_still_merge(collector):
-    # Five tokens differing in exactly one position: 4/5 = 0.8, comfortably
-    # above the threshold. Raising the threshold past that would stop the
-    # collector collapsing the near-duplicates it exists to collapse.
-    family = [_entry('<3> [prometheus] msg=compaction shard=%d done' % shard)
-              for shard in range(4)]
-    out = collector.cluster_templates(family)
-    assert len(out) == 1
-    assert out[0]["template"] == '<3> [prometheus] msg=compaction <*> done'
-    assert out[0]["variants"] == 4
+def test_neighbours_ship_as_their_own_templates(flush_lines):
+    lines = [(100 + i, text, "nethvoice4", "")
+             for i, text in enumerate([NETHCTI_LINE] + NETHCTI_NEIGHBOURS)]
+    templates = flush_lines(lines, max_lines=10)["templates"]
+    assert len(templates) == 3
+    assert all(t["count"] == 1 for t in templates)
 
 
 # --------------------------------------------------------------------------
 # Family-scoped grouping: the 82 byte-identical pam_unix(cron:session)
-# templates of 82 nethvoice instances. Keyed per instance they each formed
-# a cluster of one and all 82 shipped; keyed per family the raw dedup in
-# TemplateStore collapses them before clustering even runs.
+# templates of 82 nethvoice instances. Keyed per instance they each shipped;
+# keyed per family the raw dedup in TemplateStore collapses them.
 # --------------------------------------------------------------------------
 
 CRON_LINE = "<6> [CRON] pam_unix(cron:session): session closed for user root"
@@ -300,31 +336,4 @@ def test_flush_collapses_identical_lines_across_a_family(flush_lines):
     assert templates[0]["count"] == 82
     assert templates[0]["module_id"] == "nethvoice"
     assert bundle["budget"]["lines_kept"] == 82
-    # Collapsed by the raw (template, priority, category) dedup, not by
-    # clustering, so there is exactly one variant and no `variants` key.
     assert "variants" not in templates[0]
-
-
-def test_cluster_82_identical_entries_report_variants(collector):
-    """cluster_templates() on its own, fed 82 separate entries as it would
-    be if the dedup key still carried the instance."""
-    entries = [_entry(CRON_LINE, count=1, module_id="nethvoice")
-               for _ in range(82)]
-    out = collector.cluster_templates(entries)
-
-    assert len(out) == 1
-    assert out[0]["variants"] == 82
-    assert out[0]["count"] == 82
-
-
-def test_cluster_two_families_same_token_count_do_not_merge(collector):
-    """Bucketing is by (priority, category, token count), so the caller
-    being family-scoped is what keeps two families apart. Same token
-    count, no shared tokens after position 0 -- below CLUSTER_SIMILARITY."""
-    nethvoice = _entry("<3> [nethvoice] aaa bbb ccc ddd", module_id="nethvoice")
-    openldap = _entry("<3> [openldap] eee fff ggg hhh", module_id="openldap")
-    assert len(nethvoice["template"].split()) == len(openldap["template"].split())
-
-    out = collector.cluster_templates([nethvoice, openldap])
-    assert len(out) == 2
-    assert all("variants" not in entry for entry in out)

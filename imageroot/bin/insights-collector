@@ -206,8 +206,8 @@ def sanitize_line(raw):
 # --------------------------------------------------------------------------
 
 # Bumped by hand whenever MASKING_RULES changes, or -- as of this version --
-# whenever anything else reshapes template text, such as cluster_templates()
-# below. Either kind of change alters every template's text, so it
+# whenever anything else reshapes template text, as version 3's clustering
+# did. Either kind of change alters every template's text, so it
 # invalidates every server-side template and fingerprint at once. Travelling
 # in the bundle makes the resulting one-time duplicate burst explainable
 # instead of mysterious.
@@ -215,7 +215,7 @@ def sanitize_line(raw):
 # 3: single digits, percentages and decimals now fold; FQDNs become
 # <HOST>; GeoIP country codes become <CC>; "user=name" now folds to
 # <USER>; non-ISO dates become <DATE>; AND Drain-style clustering
-# (cluster_templates(), see CLUSTER_SIMILARITY below) now wildcards the
+# (cluster_templates(), reduced to rank_templates() in 6) now wildcards the
 # token positions that vary across near-duplicate templates within a
 # module. Both changes ship in this one version step on purpose, so the
 # fleet eats one invalidation burst instead of two.
@@ -240,19 +240,32 @@ def sanitize_line(raw):
 # shape for. Every one of those windows looked novel to the server's gate
 # and bought an LLM call.
 #
+# 6: templates are no longer wildcarded. Version 3's clustering rewrote a
+# token to <*> wherever another template of the same window differed from
+# it, so one line masked to a different template in every window, depending
+# on what else happened to arrive with it: 28% of the novel lines seen on
+# only one system of the dev fleet (2026-09-28) were such a twin.
+# rank_templates() now only orders a family's templates for its budget, and
+# a template is mask(line) and nothing else. Also: MAC addresses become
+# <MAC> -- the numeric-date rule used to take their first three groups and
+# leave the rest -- RFC 1123 dates and C build dates fold whole instead of
+# keeping their weekday and month names, a phone's user-agent in tancredi's
+# request log becomes <UA>, and rspamd log tags that happen not to be hex
+# fold like the ones that are.
+#
 # That burst is CORRELATED, not the independent trickle the server's
 # novelty gate is sized for: every template on every node goes novel in
 # the same window at once when this version first reaches a node. Do NOT
 # deploy this version before the server's LLM_MAX_CONCURRENCY limit and
 # its daily spend cap are live -- without them a fleet-wide simultaneous
 # novelty burst is an unbounded LLM bill, not a one-time blip.
-MASKING_VERSION = 5
+MASKING_VERSION = 6
 
 # Placeholders already present in the input are left alone, which is what
 # makes mask() idempotent. Listed here so one rule can protect all of them.
 _PLACEHOLDER = (
     r'<(?:TS|PID|UUID|IP|PORT|HEX|NUM|PATH|USER|DATE|HOST|CC|PCT'
-    r'|ID|DATA|TRACE|BYTES|SYMBOLS|redacted[a-z-]*)>'
+    r'|ID|DATA|TRACE|BYTES|SYMBOLS|MAC|UA|redacted[a-z-]*)>'
 )
 
 # A leading "<N>" syslog priority marker, if present, is a syntactic prefix
@@ -296,7 +309,11 @@ def _mask_hostname(match):
     return '<HOST>'
 
 
-_MONTH = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'
+_MONTH = (r'(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?'
+          r'|July?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?'
+          r'|Dec(?:ember)?)')
+_WEEKDAY = (r'(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?'
+            r'|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)')
 
 
 def _char_class(ch):
@@ -388,6 +405,26 @@ FOLD_RULES = [
         re.compile(r'(\b(?:GET|POST|PUT|PATCH|DELETE) /\S* )\{.*\}\s*$'),
         r'\1<DATA>',
     ),
+    # tancredi names the phone behind every provisioning request by its whole
+    # user-agent: model, firmware version and build date and, for Snom and
+    # Yealink, its MAC address -- one template per phone for one condition.
+    # The UA runs from after the client address to the ": " before the URL,
+    # and may itself hold colons (Snom's "SXM:0", Yealink's MAC), hence the
+    # lazy match up to a URL. The file the phone asked for is named after its
+    # MAC or its model, so the URL keeps only its first path segment, which
+    # tells /provisioning from /tancredi/api. Both replacements re-match into
+    # themselves. Anchored on tancredi's two messages rather than on any
+    # "request from", which another daemon may follow with the reason.
+    (
+        re.compile(r'(\b(?:Serving|Invalid token) request from \S+ )'
+                   r'.+?(: (?:https?://|/))'),
+        r'\1<UA>\2',
+    ),
+    (
+        re.compile(r'(\b(?:Serving|Invalid token) request from \S+ <UA>: '
+                   r'(?:https?://[^/\s]+)?/[^/\s]+)/\S+'),
+        r'\1/<PATH>',
+    ),
     # systemd-coredump's stack trace: frame count and addresses differ on
     # every crash. The process name before it is the signal and is kept.
     (
@@ -460,6 +497,21 @@ MASKING_RULES = [
         re.compile(r'/proc/\d+(?:/\S*)?'),
         '<PATH>',
     ),
+    # 1b. MAC addresses, "00:04:13:e5:9f:b4", "00-04-13-E5-9F-B4" and Cisco's
+    #     "0004.13e5.9fb4". A MAC names one device, so it is an identifier
+    #     as well as a volatile token. Before the clock rule (3), which would
+    #     take "00:04:13" as a time, and the numeric-date rule (4), which
+    #     took "00-04-13" as a date and left "<DATE>-E5-9F-B4", half an
+    #     address, in every provisioning line. The guards keep the rule off
+    #     a longer colon or dash run, which is some other thing, while still
+    #     taking a MAC followed by ": " or preceded by "mac:".
+    (
+        re.compile(r'(?<!\w)(?<!\b[0-9a-fA-F]{2}[:-])'
+                   r'[0-9a-fA-F]{2}([:-])(?:[0-9a-fA-F]{2}\1){4}[0-9a-fA-F]{2}'
+                   r'(?!\w)(?![:-][0-9a-fA-F]{2}\b)'
+                   r'|(?<![\w.])[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}(?!\w|\.\w)'),
+        '<MAC>',
+    ),
     # 2. ISO-8601 timestamps. Before clock times, which are a prefix of them.
     (
         re.compile(
@@ -469,13 +521,24 @@ MASKING_RULES = [
         '<TS>',
     ),
     # 2b. ctime timestamps, as Apache and PHP write them:
-    #     "[Fri Sep 19 10:15:30.123456 2026]". Before rule 3, which would
-    #     otherwise take only the clock and leave the weekday, the month and
-    #     the day of the month literal -- one template per day for every
-    #     line freepbx and webtop's Apache write.
+    #     "[Fri Sep 19 10:15:30.123456 2026]", and the same without the
+    #     weekday, as syslog writes it. Before rule 3, which would otherwise
+    #     take only the clock and leave the weekday, the month and the day of
+    #     the month literal -- one template per day for every line freepbx
+    #     and webtop's Apache write.
     (
-        re.compile(r'\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) ' + _MONTH +
+        re.compile(r'\b(?:' + _WEEKDAY + r' )?' + _MONTH +
                    r' +\d{1,2} \d{2}:\d{2}:\d{2}(?:\.\d+)?(?: \d{4})?\b'),
+        '<TS>',
+    ),
+    # 2c. RFC 1123 and RFC 2822 dates, as HTTP headers and mail write them:
+    #     "Sun, 21 Sep 2026 10:11:12 GMT", "Mon, 22 Sep 2026 08:00:00 +0200".
+    #     Before rule 3 for the same reason as 2b: rspamd's map check and
+    #     sequelize's deprecation notice minted one template per weekday.
+    (
+        re.compile(r'\b(?:' + _WEEKDAY + r',? )?\d{1,2} ' + _MONTH +
+                   r' \d{4} \d{2}:\d{2}(?::\d{2})?(?:\.\d+)?'
+                   r'(?: (?:GMT|UTC|UT|Z|[+-]\d{4}))?\b'),
         '<TS>',
     ),
     # 3. Bare clock times. Before the port rule, which would otherwise claim
@@ -506,6 +569,17 @@ MASKING_RULES = [
     #     month class is explicit so "12-Foo-2026" is left alone.
     (
         re.compile(r'\b\d{1,2}-' + _MONTH + r'-\d{4}\b'),
+        '<DATE>',
+    ),
+    # 5c. Dates with the month as a word and no clock: C's __DATE__, which
+    #     firmware prints as its build date ("Mar 12 2025"), "Sep 21, 2026"
+    #     and "21 Sep 2026", each with an optional weekday. A clock that
+    #     follows was already folded by rule 3, so a build date "(Mar 12
+    #     2025 - 10:11:12)" ends up "(<DATE> - <TS>)" rather than keeping
+    #     the month.
+    (
+        re.compile(r'\b(?:' + _WEEKDAY + r',? )?(?:' + _MONTH + r' +\d{1,2},? \d{4}'
+                   r'|\d{1,2} ' + _MONTH + r' \d{4})\b'),
         '<DATE>',
     ),
     # 6. UUIDs. Must precede the hex rule, which would otherwise shred a UUID
@@ -544,6 +618,15 @@ MASKING_RULES = [
     #     task writes. Before the hex rule, which needs eight characters.
     (
         re.compile(r'<[0-9a-fA-F]{5,6}>'),
+        '<HEX>',
+    ),
+    # 6f. The same tag when it is not hex -- "(controller) <qbq3yk>; map;".
+    #     Any lower-case letter or digit can appear, so the shape alone would
+    #     also take "<script>"; the process name before it and the ";" after
+    #     it are what make it rspamd's tag. <HEX> rather than <ID>, so a tag
+    #     that happens to be hex and one that does not mask to one template.
+    (
+        re.compile(r'(?<=\) )<[0-9a-z]{5,6}>(?=;)'),
         '<HEX>',
     ),
     # 7. IPv6. Must precede the hex rule for the same reason as UUIDs, and
@@ -1152,74 +1235,83 @@ def seasonal_baseline(series, target_start, minimum_samples=MIN_BASELINE_SAMPLES
 
 # Bumped whenever a digest row's shape changes, so a receiving server knows
 # which fields to expect. The deployed server still only accepts 1: the new
-# fields (expected_stddev, baseline_samples, baseline_seasonal, variants) are
-# additive and the server ignores unknown JSON fields, so this stays at 1
-# until the server explicitly opts in to a 2 it understands.
+# fields (expected_stddev, baseline_samples, baseline_seasonal) are additive
+# and the server ignores unknown JSON fields, so this stays at 1 until the
+# server explicitly opts in to a 2 it understands. A template's `variants`
+# went away with the wildcarding in masking version 6; the server never read
+# it, and counts its own variants on its own fold.
 SCHEMA_VERSION = 1
 
 # The identifier is carried in the rendered line; the priority prefix is
 # parsed back out so templates can be grouped by it.
 PRIORITY_RE = re.compile(r'^<(\d+)>')
 
-# Drain-style clustering match-ratio threshold: the fraction of token
-# positions that must still agree for a template to join an existing
-# cluster rather than start a new one. Measured on 710 live templates from
-# three rl1 dev-fleet nodes (2026-09-01): a Drain-style pass at this
-# threshold collapsed them to 249 distinct shapes (35%), with 512 of the
-# 710 landing in a multi-member cluster -- metrics1 alone contributed 223
-# templates describing 5 conditions. At 0.5, Prometheus's `msg="Deleting
-# obsolete block"` and `msg="write block"` lines -- which share their `<3>
-# [prometheus] ... msg="..."` scaffolding but differ across enough of the
-# remaining positions -- land in two separate clusters, each keeping its
-# own literal msg= text, while positional variants of the *same* message
-# (a changed component= or a changed block id) still fold into one.
-# Raising the threshold leaves more near-duplicates uncollapsed; lowering
-# it starts merging distinct conditions like the two above into one.
+# Drain-style match-ratio threshold: the fraction of token positions that
+# must still agree for rank_templates() to treat a template as one more
+# spelling of a shape it has already seen rather than a shape of its own.
+# Measured on 710 live templates from three rl1 dev-fleet nodes
+# (2026-09-01): at this threshold they fell into 249 distinct shapes (35%),
+# with 512 of the 710 in a multi-member shape -- metrics1 alone contributed
+# 223 templates describing 5 conditions. At 0.5, Prometheus's
+# `msg="Deleting obsolete block"` and `msg="write block"` lines -- which
+# share their `<3> [prometheus] ... msg="..."` scaffolding but differ across
+# enough of the remaining positions -- are two shapes, while positional
+# variants of the *same* message (a changed component= or a changed block
+# id) are one. Raising the threshold lets near-duplicates crowd a family's
+# budget again; lowering it starts treating distinct conditions like the two
+# above as one, so that one of them waits behind the other for a slot.
 CLUSTER_SIMILARITY = 0.5
 
 
-def cluster_templates(entries):
-    """Fold near-duplicate template entries into one wildcarded shape each.
+def rank_templates(entries):
+    """Order one family's template entries so that a budget taken off the
+    front buys distinct shapes before a second spelling of any one of them.
 
-    Pure and I/O-free -- no client, no I/O -- so it is unit-testable on its
-    own. `entries` is a list of the dicts TemplateStore builds
-    (template, count, module_id, priority, category, first_seen, last_seen,
-    samples); the return is a new list of the same shape, with a
-    `variants` key added -- only when it is greater than 1 -- holding how
-    many raw templates folded into that entry, so an uncollapsed entry
-    stays as lean as it was before and a reader can treat an absent
-    `variants` as 1.
+    Pure and I/O-free, so it is unit-testable on its own. `entries` is a
+    list of the dicts TemplateStore builds; the return is the same dicts,
+    none of them changed, none merged and none dropped, in the order flush()
+    should spend the family's share on them.
 
-    flush() calls this once per module FAMILY, so module_id is
-    already constant across `entries` here and is deliberately left out of
-    the bucket key below -- adding it back would be a redundant
-    comparison. Family scope is also what makes this pass worth running at
-    all: called per instance, the 82 byte-identical
-    `pam_unix(cron:session)` templates of 82 nethvoice instances each
-    formed a cluster of one and all 82 shipped. A family-keyed bucket key
-    would be the alternative if the caller ever went back to per-instance
-    -- a global pass would let [nethvoice] and [openldap] lines with the
-    same token count merge on a 0.5 match ratio.
+    It never rewrites a template, and that is the point. Version 3 of this
+    pass merged near-duplicates into one entry and rewrote every position
+    where they differed to <*>. That made a line's template depend on what
+    else arrived in the same window: alone it shipped literally, beside a
+    sibling that differed in one token it shipped with a <*> there, beside
+    a different sibling with a <*> somewhere else. The server keys novelty
+    on template text, so every such spelling looked new once and bought an
+    LLM call. A template is now mask(line) and nothing else; the server
+    folds spellings it considers one condition itself, deterministically
+    (CanonicalTemplate and prompt.Select). A persistent cluster tree would
+    not have fixed this: a pattern still widens, and each widening is a new
+    template.
+
+    What survives of the clustering is the budget use it was also for.
+    Capped by count alone, a family whose masking leaks one volatile token
+    spends its whole share on spellings of its busiest line and truncates
+    away the rare, distinct line the server's novelty gate exists to see.
+    So entries are grouped by similarity as before, and ranked: every
+    shape's busiest spelling first, then every shape's second spelling, and
+    so on, each rank busiest first.
+
+    flush() calls this once per module FAMILY, so module_id is constant
+    across `entries` and is left out of the bucket key below.
 
     Bucketing: two entries are only ever compared when they agree on
-    priority, category and token count (len(template.split())) -- a
-    wildcarded pattern never changes length, so a mismatched token count
-    could never match regardless of content.
+    priority, category and token count (len(template.split())) -- the
+    comparison is positional, so a mismatched token count could never match
+    regardless of content.
 
     Within a bucket this is a greedy Drain-style assignment. Entries are
     processed in a deterministic (-count, template) order first, so the
-    same input always produces the same clusters regardless of arrival
-    order -- without that, the shapes shipped would drift window to
-    window even when the underlying events do not, which would mint a
-    fresh "novel" template every run and defeat the whole point of
-    clustering. Each entry is compared position-by-position against every
-    existing cluster's current pattern: a position counts as matching only
-    when the cluster still holds literal text there AND that text equals
-    the entry's token; a position where the cluster already holds <*>
-    counts as NOT matching, which is what stops a cluster from widening
-    until it silently absorbs everything. The entry joins the first
-    cluster whose match ratio reaches CLUSTER_SIMILARITY; otherwise it
-    seeds a new cluster of its own.
+    same input always produces the same order regardless of arrival order.
+    Each entry is compared position-by-position against every existing
+    shape's pattern: a position counts as matching only when the pattern
+    still holds literal text there AND that text equals the entry's token; a
+    position the pattern has already seen vary counts as NOT matching, which
+    is what stops a shape from widening until it silently absorbs
+    everything. The entry joins the first shape whose match ratio reaches
+    CLUSTER_SIMILARITY; otherwise it starts a shape of its own. The pattern
+    is internal and never leaves this function.
     """
     buckets = collections.OrderedDict()
     for entry in entries:
@@ -1227,85 +1319,46 @@ def cluster_templates(entries):
         key = (entry["priority"], entry["category"], len(tokens))
         buckets.setdefault(key, []).append((entry, tokens))
 
-    out = []
+    ranked = []
     for bucket in buckets.values():
         bucket.sort(key=lambda pair: (-pair[0]["count"], pair[0]["template"]))
-        clusters = []
+        # Each shape is [pattern, spellings so far]; a pattern position is
+        # None once two spellings have disagreed there.
+        shapes = []
         for entry, tokens in bucket:
             target = None
             # An empty template has no positions to compare, so it could
             # never reach the threshold anyway: skipping the search is
-            # what keeps the ratio below from dividing by zero. Neither
-            # line_format nor sanitize_line() can produce one today, but
-            # the cost of being wrong about that is the whole window.
-            for cluster in (clusters if tokens else ()):
-                pattern = cluster["tokens"]
+            # what keeps the ratio below from dividing by zero.
+            for shape in (shapes if tokens else ()):
+                pattern = shape[0]
                 matches = sum(
                     1 for i in range(len(tokens))
-                    if pattern[i] != '<*>' and pattern[i] == tokens[i]
+                    if pattern[i] is not None and pattern[i] == tokens[i]
                 )
                 if matches / len(tokens) >= CLUSTER_SIMILARITY:
-                    target = cluster
+                    target = shape
                     break
 
             if target is None:
-                clusters.append({
-                    "tokens": list(tokens),
-                    "variants": 1,
-                    "merged": {
-                        "template": entry["template"],
-                        "count": entry["count"],
-                        "module_id": entry["module_id"],
-                        "priority": entry["priority"],
-                        "category": entry["category"],
-                        "first_seen": entry["first_seen"],
-                        "last_seen": entry["last_seen"],
-                        "samples": list(entry["samples"]),
-                        # Copied, not aliased: the merge below mutates this
-                        # set, and the entry it came from is still the
-                        # caller's.
-                        "nodes": set(entry.get("nodes") or ()),
-                    },
-                })
+                shapes.append([list(tokens), 1])
+                ranked.append((0, entry))
                 continue
 
-            pattern = target["tokens"]
-            # Position 0 is the "<N>" priority marker line_format adds, and
-            # it is already part of the bucket key above, so it always
-            # matches here regardless. Excluded from the loop explicitly
-            # (range starts at 1) rather than relying on that -- belt and
-            # braces, so a future change to the bucket key could not
-            # silently start wildcarding it.
-            for i in range(1, len(tokens)):
+            pattern = target[0]
+            for i in range(len(tokens)):
                 if pattern[i] != tokens[i]:
-                    pattern[i] = '<*>'
-            merged = target["merged"]
-            merged["count"] += entry["count"]
-            merged["first_seen"] = min(merged["first_seen"], entry["first_seen"])
-            merged["last_seen"] = max(merged["last_seen"], entry["last_seen"])
-            # Attribution is a union across the fold, never the winner's set:
-            # the same condition can mask to different variants on different
-            # nodes, and keeping only the representative's nodes would blame
-            # whichever node happened to produce the busiest variant. The
-            # server's prompt.Select does the same at its own fold.
-            merged.setdefault("nodes", set()).update(entry.get("nodes") or ())
-            # Same first-then-overwrite-last convention TemplateStore
-            # uses for duplicate raw lines, one level up: keep the first
-            # sample seen, and let the most recently merged entry's own
-            # last sample keep overwriting the second slot.
-            if len(merged["samples"]) == 1:
-                merged["samples"].append(entry["samples"][-1])
-            else:
-                merged["samples"][1] = entry["samples"][-1]
-            target["variants"] += 1
+                    pattern[i] = None
+            ranked.append((target[1], entry))
+            target[1] += 1
 
-        for cluster in clusters:
-            merged = cluster["merged"]
-            merged["template"] = " ".join(cluster["tokens"])
-            if cluster["variants"] > 1:
-                merged["variants"] = cluster["variants"]
-            out.append(merged)
-    return out
+    # Priority and category break the last tie: the same text can be two
+    # entries in two buckets, and the order TemplateStore hands them over in
+    # is LRU order, which depends on the window.
+    ranked.sort(key=lambda pair: (pair[0], -pair[1]["count"],
+                                  pair[1]["template"], pair[1]["priority"],
+                                  pair[1]["category"] or ""))
+    return [entry for _rank, entry in ranked]
 
 
 # --------------------------------------------------------------------------
@@ -1849,15 +1902,13 @@ def flush(client, store, window, max_lines, self_identifier, system_id,
         family_entries = by_family[family]
         share = shares.get(family, MIN_SHARE)
 
-        # Cluster before the sort-and-truncate-to-share step below:
-        # clustering first means the family's budget buys distinct *shapes*
-        # rather than near-duplicate spellings of one shape -- capping first
-        # would let a handful of near-duplicate templates crowd out a
-        # genuinely distinct one before clustering ever got a chance to
-        # collapse them.
-        clustered = cluster_templates(family_entries)
-        ordered = sorted(clustered, key=lambda t: (-t["count"], t["template"]))
-        kept = ordered[:share]
+        # Rank before truncating to the share: ranked, the family's budget
+        # buys distinct *shapes* before near-duplicate spellings of one
+        # shape -- capped by count alone, a handful of near-duplicates of
+        # the busiest line would crowd out a genuinely distinct one. The
+        # kept entries then ship busiest first, as they always have.
+        ordered = rank_templates(family_entries)
+        kept = sorted(ordered[:share], key=lambda t: (-t["count"], t["template"]))
         for entry in kept:
             if not entry.get("category"):
                 entry.pop("category", None)

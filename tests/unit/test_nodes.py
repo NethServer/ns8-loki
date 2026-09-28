@@ -46,7 +46,7 @@ def test_store_tolerates_a_missing_node_id(collector):
 
 
 # --------------------------------------------------------------------------
-# cluster_templates(): the union across a variant fold.
+# rank_templates(): each spelling keeps its own nodes.
 # --------------------------------------------------------------------------
 
 def _entry(template, nodes, count=1):
@@ -57,21 +57,20 @@ def _entry(template, nodes, count=1):
     }
 
 
-def test_clustering_unions_the_nodes_of_folded_variants(collector):
-    """The same condition can mask to different variants on different
-    nodes. Keeping only the representative's set would blame whichever node
-    produced the busiest variant."""
-    out = collector.cluster_templates([
+def test_ranking_leaves_each_spelling_its_own_nodes(collector):
+    """Two spellings of one condition on two nodes are no longer folded into
+    one entry at the edge, so each keeps the nodes it was seen on. The
+    server's prompt.Select unions them when it folds the two itself."""
+    out = collector.rank_templates([
         _entry('<3> [prometheus] msg="Deleting obsolete block" component=eu', [1]),
         _entry('<3> [prometheus] msg="Deleting obsolete block" component=us', [3]),
     ])
 
-    assert len(out) == 1
-    assert out[0]["nodes"] == {1, 3}
+    assert sorted(sorted(entry["nodes"]) for entry in out) == [[1], [3]]
 
 
-def test_clustering_leaves_a_solo_template_its_own_nodes(collector):
-    out = collector.cluster_templates([_entry("<3> [a] only one", [2])])
+def test_ranking_leaves_a_solo_template_its_own_nodes(collector):
+    out = collector.rank_templates([_entry("<3> [a] only one", [2])])
     assert out[0]["nodes"] == {2}
 
 
