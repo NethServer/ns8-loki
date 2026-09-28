@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2026 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+import json
+import subprocess
+import sys
+
+import agent
+
+request = json.load(sys.stdin)
+
+if request['active']:
+    # Unlike set-clm-forwarder, a missing subscription does not abort the
+    # action: the collector re-reads cluster/subscription from Redis at each
+    # fire, so a subscription registered later starts working with no
+    # reconfiguration here.
+    subscription = agent.redis_connect().hgetall('cluster/subscription')
+    if not subscription:
+        print("No subscription found: bundles will not ship until the node has a subscription",
+              file=sys.stderr)
+
+    agent.set_env('INSIGHTS_SERVER_URL', request['base_url'].rstrip('/'))
+    agent.set_env('INSIGHTS_VERIFY_TLS', '1' if request.get('verify_tls', True) else '0')
+
+    # The collector is a long-running daemon that follows the log stream
+    # and reads its environment once at startup, so a
+    # reconfigure while already active needs an explicit restart to pick up
+    # the new base_url/verify_tls. `enable` (no --now) then `restart` covers
+    # both a first activation (restart on a stopped unit just starts it) and
+    # a live reconfigure in one call.
+    subprocess.run(["systemctl", "--user", "enable", "insights-collector.service"],
+                   stdout=sys.stderr,
+                   stderr=sys.stderr,
+                   text=True,
+                   check=True)
+    subprocess.run(["systemctl", "--user", "restart", "insights-collector.service"],
+                   stdout=sys.stderr,
+                   stderr=sys.stderr,
+                   text=True,
+                   check=True)
+else:
+    agent.munset_env(['INSIGHTS_SERVER_URL', 'INSIGHTS_VERIFY_TLS'])
+    subprocess.run(["systemctl", "--user", "disable", "--now", "insights-collector.service"],
+                   stdout=sys.stderr,
+                   stderr=sys.stderr,
+                   text=True,
+                   check=True)
