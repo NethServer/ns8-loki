@@ -1,5 +1,8 @@
 auth_enabled: false
 
+analytics:
+  reporting_enabled: ${LOKI_REPORTING_ENABLED:-true}
+
 server:
   http_listen_port: 3100
 
