@@ -21,6 +21,7 @@ ExecStart=/usr/bin/podman run \
     --env=LOKI_RETENTION_PERIOD \
     --env=LOKI_ALLOW_STRUCTURED_METADATA \
     --env=LOKI_V13_SCHEMA_START \
+    --env=LOKI_REPORTING_ENABLED \
     ${LOKI_IMAGE} \
     -config.file=/etc/loki/local-config.yaml \
     -log.level=warn \

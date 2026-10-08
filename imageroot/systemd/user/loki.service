@@ -15,6 +15,7 @@ ExecStartPre=/usr/bin/podman pod create \
     --name loki \
     --network=slirp4netns:port_handler=rootlesskit \
     --publish ${LOKI_HTTP_PORT}:8080 \
+    $PODMAN_POD_OPTS \
     --replace
 ExecStart=/usr/bin/podman pod start --pod-id-file %t/loki.pod-id
 ExecStop=/usr/bin/podman pod stop --ignore --pod-id-file %t/loki.pod-id -t 10

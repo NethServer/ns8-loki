@@ -91,6 +91,45 @@ api-cli run module/loki1/get-configuration
 
 Note: `active_to` field WILL miss if the instance is still active.
 
+## Environment variables
+
+Some advanced settings are read from the module environment:
+
+- `LOKI_REPORTING_ENABLED`: set to `false` to disable the Loki
+  [usage reporting](https://grafana.com/docs/loki/latest/configure/#analytics)
+  to `stats.grafana.org`. Default is `true`.
+- `PODMAN_POD_OPTS`: additional options for the `podman pod create`
+  command of the `loki` pod, for example `--add-host`. Default is empty.
+
+### Disable telemetry
+
+Loki periodically sends anonymous usage statistics to
+`stats.grafana.org`. If the request is blocked (e.g. by a DNS filter
+like Pi-hole) Loki keeps retrying, generating many DNS queries.
+
+To disable the usage reporting, run:
+
+```bash
+runagent -m loki1 python3 -c 'import agent ; agent.set_env("LOKI_REPORTING_ENABLED", "false")'
+runagent -m loki1 systemctl --user restart loki.service
+```
+
+As an alternative, or in addition, `stats.grafana.org` can be resolved
+to the loopback address inside the pod, so connection attempts fail
+immediately without leaving the node:
+
+```bash
+runagent -m loki1 python3 -c 'import agent ; agent.set_env("PODMAN_POD_OPTS", "--add-host=stats.grafana.org:127.0.0.1")'
+runagent -m loki1 systemctl --user restart loki.service
+```
+
+To revert to the defaults, remove the variables:
+
+```bash
+runagent -m loki1 python3 -c 'import agent ; agent.munset_env(["LOKI_REPORTING_ENABLED", "PODMAN_POD_OPTS"])'
+runagent -m loki1 systemctl --user restart loki.service
+```
+
 ## Uninstall
 
 To uninstall the instance:
